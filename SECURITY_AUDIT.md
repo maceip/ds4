@@ -1,451 +1,285 @@
-# DS4 Inference Engine Security Audit
+# Security Audit: `ds4_server.c`
 
-**Scope:** `ds4.c` and `ds4.h` — the core ~26k-line inference engine  
-**Date:** 2026-06-26  
-**Severity threshold:** MEDIUM and above  
-
----
-
-## Executive Summary
-
-The DS4 inference engine demonstrates generally good defensive coding for a
-C codebase of this size.  GGUF parsing uses a bounded cursor abstraction that
-prevents most reads beyond the mmap, tensor offsets are validated against the
-file size, and integer overflow is checked in several critical size calculations.
-
-However, the audit identified **8 findings at MEDIUM severity or higher**.  The
-most impactful are related to GGUF file parsing (the primary untrusted-input
-surface), the instance lock file, and potential memory-exhaustion denial-of-service
-through unchecked allocation sizes derived from attacker-controlled GGUF header
-fields.
+**Date:** 2026-06-26
+**Scope:** HTTP parsing, JSON parsing, memory safety, DoS, race conditions, information disclosure, request smuggling
+**Exclusions:** Missing auth/CORS wildcard/DNS rebinding/TLS (known/accepted)
 
 ---
 
 ## Findings
 
-### FINDING 1 — GGUF metadata/tensor count can trigger memory-exhaustion DoS
+### 1. `buf_reserve` — Integer Overflow in Capacity Doubling Loop
 
-**File:** `ds4.c`  
-**Lines:** 1838, 1868, 1960–1961  
-**Severity:** MEDIUM  
-**Category:** Denial of Service / Resource Exhaustion  
-
-**Description:**  
-`n_kv` and `n_tensors` are read as raw `uint64_t` values from the GGUF header
-and used directly as allocation counts:
+**Severity: MEDIUM**
+**Location:** Lines 118–119
 
 ```c
-// line 1838
-m->kv = calloc((size_t)m->n_kv, sizeof(m->kv[0]));
-
-// line 1868
-m->tensors = calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
+size_t cap = b->cap ? b->cap * 2 : 256;
+while (cap < need) cap *= 2;
 ```
 
-A crafted GGUF file can set `n_kv` or `n_tensors` to a very large value (e.g.
-`2^60`).  The `calloc` will attempt to allocate an enormous amount of memory.
-While `calloc` may return `NULL` (handled by `ds4_die`), on Linux with
-overcommit enabled, the allocation may succeed but later cause OOM-killer
-invocations or swap thrashing, effectively denying service to the entire
-machine.
+**Description:**
+The capacity-doubling loop can overflow `size_t` and wrap to zero (or a small value) on platforms where `SIZE_MAX + 1 == 0`. For example, if `b->cap` is `2^63` (on 64-bit), the first doubling wraps to 0, causing `cap < need` to remain true indefinitely — creating an **infinite loop** (DoS). Even if the loop terminates at a wrapped-around small value, `xrealloc(b->ptr, cap)` allocates a tiny buffer while `b->cap` records the wrapped value, leading to a subsequent **heap buffer overflow** in `buf_append`.
 
-There is no upper-bound check that `n_kv` or `n_tensors` is reasonable
-relative to the file size.  For example, each metadata KV entry requires at
-minimum ~13 bytes (key-length prefix + type + smallest value), so `n_kv`
-cannot exceed `file_size / 13`.
+**Attack path:**
+The initial overflow guard at line 115 (`add > SIZE_MAX - b->len - 1`) prevents the *sum* from overflowing, but does not prevent the doubling loop from wrapping. A sufficiently large `need` value (e.g., `need ≈ SIZE_MAX/2 + 2`) passes the guard but overflows during doubling. In practice, this requires allocating >4 GiB of request data on 32-bit platforms, or >8 EiB on 64-bit. On 64-bit systems, `xrealloc` will fail before reaching such sizes, so exploitability is limited to 32-bit builds or unusual memory configurations.
 
-**Exploitability:** An attacker supplies a malicious GGUF model file.  This
-is the primary untrusted-input surface.  Any user or operator who downloads a
-GGUF from an untrusted source (model-sharing sites, p2p, etc.) is affected.
+**Exploitability: LOW** on 64-bit (memory exhaustion first), **MEDIUM** on 32-bit.
 
-**Recommendation:**  
-Add sanity checks after parsing the GGUF header:
-
+**Recommendation:** Add an overflow check in the doubling loop:
 ```c
-if (m->n_kv > m->size / 13 || m->n_tensors > m->size / 16)
-    ds4_die("GGUF header claims more metadata/tensors than the file could hold");
-```
-
----
-
-### FINDING 2 — `next_pow2` infinite loop on large hash table sizes from crafted GGUF
-
-**File:** `ds4.c`  
-**Lines:** 20420–20424, 20427  
-**Severity:** MEDIUM  
-**Category:** Denial of Service (CPU hang)  
-
-**Description:**  
-The `next_pow2` function uses a left-shift loop:
-
-```c
-static uint64_t next_pow2(uint64_t n) {
-    uint64_t p = 1;
-    while (p < n) p <<= 1;
-    return p;
+while (cap < need) {
+    if (cap > SIZE_MAX / 2) die("buffer overflow");
+    cap *= 2;
 }
 ```
 
-`table_init` calls it with `expected * 2 + 16`:
-
-```c
-static void table_init(str_i32_table *t, uint64_t expected) {
-    t->cap = next_pow2(expected * 2 + 16);
-```
-
-If a malicious GGUF declares a tokenizer with `tokens.len` close to
-`UINT64_MAX / 2` (the `len` field is a uint64 read from GGUF metadata), then
-`expected * 2 + 16` wraps around to a small value or `expected * 2` itself
-overflows.  Additionally, if `expected * 2 + 16 > 2^63`, the `next_pow2`
-loop will shift `p` through `2^63` (which is `INT64_MIN` as signed, but as
-`uint64_t` is fine), then to `0` via overflow, and then loop forever
-(`0 < n` is always true for any `n > 0`).
-
-**Attack path:** The `tokens.len` and `merges.len` fields are uint64 values
-read from the GGUF tokenizer arrays.  While `tokens.len` is bounded by
-`INT32_MAX` (line 20952), `merges.len` has no upper bound check (line 20955–20958).
-
-**Exploitability:** A crafted GGUF with a large `merges.len` causes a CPU
-hang during model load.  The process becomes unresponsive.
-
-**Recommendation:**  
-1. Add a bounds check on `merges.len` similar to `tokens.len`.
-2. Use bit manipulation instead of a loop: `p = 1ULL << (64 - __builtin_clzll(n - 1))` with appropriate edge-case guards.
-
 ---
 
-### FINDING 3 — `/tmp/ds4.lock` symlink attack (local privilege escalation / DoS)
+### 2. `content_length` — First-Match Semantics Enable Request Smuggling via Duplicate Headers
 
-**File:** `ds4.c`  
-**Lines:** 21879–21921  
-**Severity:** MEDIUM  
-**Category:** TOCTOU / Symlink attack  
-
-**Description:**  
-The instance lock file defaults to `/tmp/ds4.lock`, a world-writable directory:
+**Severity: MEDIUM**
+**Location:** Lines 10988–11003
 
 ```c
-const char *path = getenv("DS4_LOCK_FILE");
-if (!path || !path[0]) path = "/tmp/ds4.lock";
-
-const int fd = open(path, O_RDWR | O_CREAT, 0600);
-```
-
-The `open()` call follows symlinks.  A local attacker can create a symlink at
-`/tmp/ds4.lock` pointing to an arbitrary file (e.g. `/etc/crontab`, a user's
-`.bashrc`, or a critical system file).  When DS4 runs (potentially as a
-different user, or as root in some deployment configurations), it will:
-
-1. Open the target file via the symlink with `O_RDWR | O_CREAT`.
-2. Call `ftruncate(fd, 0)` (line 21913), **destroying the target file's contents**.
-3. Write `dprintf(fd, "%ld\n", (long)getpid())` into the file.
-
-This is a classic `/tmp` symlink race.  Even if the attacker cannot escalate
-privileges, they can cause denial of service by pointing the symlink at DS4's
-own model file or other critical data.
-
-**Exploitability:** Requires local access to the `/tmp` directory on the same
-machine.  Exploitable in any multi-user or containerized environment where DS4
-runs.  The `DS4_LOCK_FILE` environment variable override does not help since
-the default is always `/tmp`.
-
-**Recommendation:**  
-Use `O_NOFOLLOW` to prevent following symlinks, and create the file in a
-user-owned directory (e.g. `$XDG_RUNTIME_DIR` or `$HOME/.ds4/`):
-
-```c
-const int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
-```
-
-Or use a directory under `/run/user/$(id -u)/` which is per-user and not
-world-writable.
-
----
-
-### FINDING 4 — `/tmp/ds4-session-payload.XXXXXX` temp file in world-writable directory
-
-**File:** `ds4.c`  
-**Lines:** 22895–22900  
-**Severity:** MEDIUM  
-**Category:** Information Disclosure / Symlink attack  
-
-**Description:**  
-Session payloads are staged through a temporary file in `/tmp`:
-
-```c
-char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
-int fd = mkstemp(tmpl);
-```
-
-While `mkstemp` itself is safe against symlink races (it creates the file
-with `O_EXCL`), the predictable prefix `ds4-session-payload` in a
-world-readable directory creates two risks:
-
-1. **Information disclosure:** The session payload contains the full KV cache,
-   logits, and token history.  On some systems, the file permissions from
-   `mkstemp` may inherit a permissive umask (the mask is applied to `0600`,
-   but some environments override this).  A local attacker can monitor `/tmp`
-   for new files matching the pattern.
-
-2. **Temp file exhaustion DoS:** An attacker can pre-create many files matching
-   the `XXXXXX` pattern space to cause `mkstemp` to fail.
-
-**Attack path:** Local attacker on the same machine monitors `/tmp` for session
-payload files.  The payload contains the user's conversation tokens, which may
-include sensitive prompts.
-
-**Recommendation:**  
-Use a private directory (e.g. under `$TMPDIR`, `$XDG_RUNTIME_DIR`, or a
-subdirectory created by the server with restricted permissions).
-
----
-
-### FINDING 5 — Integer overflow in `bpe_rank` length calculation
-
-**File:** `ds4.c`  
-**Lines:** 20673–20676  
-**Severity:** LOW-MEDIUM  
-**Category:** Integer Overflow / Heap Buffer Overflow  
-
-**Description:**  
-The `bpe_rank` function computes a concatenated key length:
-
-```c
-static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str *b) {
-    uint64_t len = a->len + 1 + b->len;
-    char stack[512];
-    char *buf = len <= sizeof(stack) ? stack : xmalloc((size_t)len);
-
-    memcpy(buf, a->ptr, (size_t)a->len);
-    buf[a->len] = ' ';
-    memcpy(buf + a->len + 1, b->ptr, (size_t)b->len);
-```
-
-If `a->len + 1 + b->len` overflows `uint64_t` (theoretically requires
->= 2^63 sized strings), or more practically if the `(size_t)` cast truncates
-on a 32-bit platform, the allocated buffer could be smaller than expected,
-causing a heap buffer overflow.
-
-In practice, `a` and `b` are `owned_str` values derived from `byte_encode`
-which allocates `in.len * 4 + 1` bytes (line 20640).  The `in.len` comes
-from the GGUF-declared token strings.  On a 64-bit platform, overflow requires
-impractically large token strings, but the code lacks an explicit guard.
-
-**Exploitability:** Very difficult on 64-bit.  Could matter on 32-bit
-platforms if the engine is ever ported.
-
-**Recommendation:**  
-Add an overflow check: `if (a->len > SIZE_MAX - b->len - 1) ds4_die(...)`.
-
----
-
-### FINDING 6 — GPU allocation failures are silently aggregated, not individually reported
-
-**File:** `ds4.c`  
-**Lines:** 10849–10997, 11054–11097  
-**Severity:** MEDIUM  
-**Category:** Insufficient Error Handling / Undefined Behavior  
-
-**Description:**  
-The `metal_graph_alloc_raw_cap` function performs approximately 80+ GPU tensor
-allocations sequentially.  Each `ds4_gpu_tensor_alloc()` call may return `NULL`
-on failure, but the results are not checked individually.  Instead, all
-allocations proceed, and a single aggregate NULL check happens at the end
-(lines 11054–11097):
-
-```c
-const bool ok = state_init_ok && layer_cache_ok &&
-                g->cur_hc && g->flat_hc && g->hc_mix && ...
-```
-
-**Problems with this approach:**
-
-1. **NULL pointer dereference between allocations:** Between lines 10849 and
-   11054, several operations use earlier allocations that may have returned
-   NULL.  For example, `ds4_gpu_tensor_view` (lines 10853–10859) is called on
-   `g->hc_split` which may be NULL.  Similarly, `metal_tensor_fill_f32`
-   (line 10891) is called on tensors that may be NULL — though it does check
-   `if (g->layer_attn_state_kv[il])`.
-
-2. **Partial GPU state on failure:** If the aggregate check fails at line 11097,
-   `metal_graph_free` is called, which must correctly handle a mix of NULL and
-   non-NULL tensors.
-
-3. **Silent failure mode:** The caller (`ds4_session_create`) gets a boolean
-   `false` return with no diagnostic about which allocation failed or how much
-   GPU memory was available.
-
-**Attack path:** An attacker cannot directly control GPU memory pressure in most
-deployment models, but in shared-GPU environments (cloud inference, multi-tenant
-setups), a co-tenant could exhaust GPU memory to trigger this path.
-
-**Recommendation:**  
-Check each allocation immediately and return with a diagnostic error on the
-first failure.  This also avoids wasting GPU memory on subsequent allocations
-that will be freed anyway.
-
----
-
-### FINDING 7 — GGUF `general.alignment` can be set to zero (division in `align_up`)
-
-**File:** `ds4.c`  
-**Lines:** 1498–1501, 1854–1858  
-**Severity:** LOW-MEDIUM  
-**Category:** Division by Zero / Undefined Behavior  
-
-**Description:**  
-The `align_up` function computes a modulo:
-
-```c
-static uint64_t align_up(uint64_t value, uint64_t alignment) {
-    uint64_t rem = value % alignment;
-    return rem == 0 ? value : value + alignment - rem;
-}
-```
-
-The `general.alignment` metadata value is used as the alignment for tensor
-data:
-
-```c
-if (cursor_u32(&tmp, &alignment) && alignment != 0) {
-    m->alignment = alignment;
-}
-```
-
-While the zero check (line 1856) guards the initial assignment, the default
-`m->alignment = 32` (line 1841) means a zero value in the GGUF just keeps
-the default.  However, `align_up` itself has no guard against a zero
-`alignment` argument.  If any other code path calls `align_up` with a zero
-divisor, undefined behavior (division by zero) occurs.
-
-**Exploitability:** Currently low because the alignment assignment is guarded.
-This is a latent risk if `align_up` is reused elsewhere.
-
-**Recommendation:**  
-Add `if (alignment == 0) return value;` at the top of `align_up`.
-
----
-
-### FINDING 8 — Token ID bounds not checked in `ds4_session_eval` path
-
-**File:** `ds4.c`  
-**Lines:** 25569–25602, 25660  
-**Severity:** MEDIUM  
-**Category:** Out-of-Bounds Memory Access  
-
-**Description:**  
-The `ds4_session_eval` function accepts an arbitrary `int token` from the
-caller and passes it directly through to the forward pass.  While the
-embedding function `embed_token_f16` (line 4295–4299) does check bounds:
-
-```c
-static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float *out) {
-    ds4_tensor *te = w->token_embd;
-    if (token < 0 || (uint64_t)token >= te->dim[1]) {
-        ds4_die("token id is outside the embedding table");
+static long content_length(const char *h, size_t n) {
+    // ...
+    if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
+        const char *v = line + 15;
+        while (v < line + len && isspace((unsigned char)*v)) v++;
+        return strtol(v, NULL, 10);   // returns on FIRST match
     }
+    // ...
+    return 0;
+}
 ```
 
-This check calls `ds4_die` which terminates the entire process.  For a server
-deployment (ds4-server), a single malicious API request with an out-of-range
-token ID kills the server process, denying service to all other clients.
+**Description:**
+The function returns the value of the **first** `Content-Length` header it encounters. RFC 9110 §8.6 requires that if multiple `Content-Length` headers are present with different values, the message must be rejected. This server silently uses the first value.
 
-The `ds4_session_eval` public API (line 25660) does not validate the token
-range itself, relying on the fatal `ds4_die` inside the forward pass.
+If a reverse proxy sits in front of this server and uses the **last** `Content-Length` header (as some proxies do), an attacker can send:
+```
+Content-Length: 0\r\n
+Content-Length: 42\r\n
+```
+The proxy forwards 42 bytes of body, but ds4 reads 0 bytes of body. The remaining 42 bytes become the start of the **next** HTTP request on the same connection — a classic request smuggling attack.
 
-Similarly, `ds4_session_sync` passes caller-provided token arrays into the
-prefill path.  Any out-of-range token in the prompt triggers a fatal abort
-rather than a recoverable error.
+**Attack path:**
+Attacker → reverse proxy → ds4. Duplicate Content-Length headers with different values. Proxy uses last value, ds4 uses first. Leads to request smuggling (cache poisoning, auth bypass, request routing manipulation).
 
-**Attack path:** An attacker sends an API request (e.g. via the HTTP server)
-with a crafted token ID outside `[0, n_vocab)`.  The server process crashes.
+**Exploitability: MEDIUM** (requires a front-end proxy with last-match CL semantics; the `Connection: close` response header mitigates pipelining on the response side, but the attack targets the *request* parsing side).
 
-**Recommendation:**  
-1. Check token bounds in `ds4_session_eval` and `ds4_session_sync` before
-   entering the forward pass, returning an error code instead of aborting.
-2. Change `embed_token_f16` to return an error rather than calling `ds4_die`.
+**Recommendation:** Reject requests with multiple `Content-Length` headers bearing different values, or reject any request with duplicate `Content-Length` headers.
+
+---
+
+### 3. No `Transfer-Encoding` Handling — Request Smuggling via Chunked Encoding
+
+**Severity: MEDIUM**
+**Location:** `read_http_request`, lines 11005–11051
+
+**Description:**
+The server does not parse or reject `Transfer-Encoding: chunked` requests. If a client sends a chunked-encoded request, the server ignores `Transfer-Encoding` entirely and falls back to `Content-Length` (or 0 if absent). The chunked body is then either:
+- Silently discarded (if `Content-Length: 0` or absent), or
+- Partially read as raw chunked framing, corrupting the JSON body parse.
+
+When a reverse proxy decodes chunked encoding before forwarding, this is safe. But when a proxy passes `Transfer-Encoding: chunked` through without decoding, the server and proxy disagree on message boundaries — the classic CL/TE desync.
+
+**Attack path:**
+Attacker sends `Transfer-Encoding: chunked` with a crafted chunked body. A forwarding proxy interprets the body via chunked framing; ds4 interprets it via Content-Length. This desync can smuggle a second request.
+
+**Exploitability: MEDIUM** (depends on proxy configuration).
+
+**Recommendation:** If `Transfer-Encoding` is present, either:
+- Decode chunked encoding, or
+- Reject the request with 501 Not Implemented.
+
+---
+
+### 4. `json_number` Accepts Non-JSON Number Formats via `strtod`
+
+**Severity: MEDIUM**
+**Location:** Lines 258–266
+
+```c
+static bool json_number(const char **p, double *out) {
+    json_ws(p);
+    char *end = NULL;
+    double v = strtod(*p, &end);
+    if (end == *p) return false;
+    *p = end;
+    *out = v;
+    return true;
+}
+```
+
+**Description:**
+`strtod` accepts formats that are not valid JSON numbers:
+- Hexadecimal floats: `0x1.0p10` → 1024.0
+- Infinity: `inf`, `infinity` (locale-dependent)
+- NaN: `nan`, `nan(...)` (locale-dependent)
+
+When `strtod` returns `NaN` or `Inf`, these propagate into `r->temperature`, `r->top_p`, `r->min_p`, or `r->seed`. Passing `NaN`/`Inf` to downstream sampling functions may cause undefined behavior, assertion failures, or infinite loops in the inference engine.
+
+**Attack path:**
+```json
+{"messages":[...], "temperature": nan, "top_p": inf}
+```
+These parse successfully and propagate to `ds4_session` sampling parameters. Impact depends on how the engine handles non-finite floats — at minimum it produces undefined sampling behavior; at worst it causes a crash or hang in the model decode loop.
+
+**Exploitability: MEDIUM** (easy to trigger, impact depends on engine internals).
+
+**Recommendation:** After `strtod`, reject non-finite values:
+```c
+if (!isfinite(v)) return false;
+```
+
+---
+
+### 5. Unbounded Client Thread Creation — Resource Exhaustion DoS
+
+**Severity: MEDIUM**
+**Location:** Lines 11657–11688
+
+```c
+while (!g_stop_requested) {
+    int fd = accept(lfd, NULL, NULL);
+    // ...
+    pthread_mutex_lock(&s.mu);
+    s.clients++;
+    pthread_mutex_unlock(&s.mu);
+    pthread_t th;
+    if (pthread_create(&th, NULL, client_main, ca) != 0) {
+        // cleanup on failure
+    }
+    pthread_detach(th);
+}
+```
+
+**Description:**
+There is no limit on the number of concurrent client threads. Each accepted connection spawns a new `pthread` without checking `s.clients` against any maximum. An attacker can open thousands of connections simultaneously. Each thread consumes ~8 MiB of stack (default `pthread` stack size on Linux), plus per-request heap allocations. With 1000 connections, that's ~8 GiB of stack memory alone.
+
+Even though the single worker thread serializes inference, the HTTP parsing and body reading in `client_main` runs in the per-client thread. An attacker can hold connections open (slowloris-style) while consuming thread/memory resources.
+
+**Attack path:**
+Attacker opens thousands of TCP connections. Each spawns a thread. The server exhausts virtual memory or hits the OS thread limit, preventing legitimate clients from connecting.
+
+**Exploitability: HIGH** (trivial to execute, no authentication required).
+
+**Recommendation:** Add a `max_clients` limit. Before creating a thread, check `s.clients < max_clients` and reject with HTTP 503 if exceeded.
+
+---
+
+### 6. Unbounded JSON Arrays/Objects in Request Body — Memory Exhaustion DoS
+
+**Severity: MEDIUM**
+**Location:** `parse_messages` (line 1598), `parse_stop` (line 927), `parse_tools_value` (line 1553), `parse_tool_calls_value` (line 1105)
+
+**Description:**
+While the HTTP body is capped at 64 MiB (`max_body`), the JSON parsing functions impose no limits on the number of array elements. A 64 MiB request body can contain millions of messages, tool definitions, or stop sequences. Each element triggers heap allocations (strings, structs), and the resulting data structures can amplify memory usage significantly beyond the 64 MiB input:
+- Each `chat_msg` has multiple heap-allocated string fields
+- Each `tool_call` has 3 string fields plus struct overhead
+- `stop_list` entries are individually heap-allocated
+
+A carefully crafted request with millions of tiny messages or tool definitions could consume hundreds of MiB or GiB of heap memory during parsing.
+
+**Attack path:**
+```json
+{"messages": [{"role":"user","content":"a"},{"role":"user","content":"a"}, ... (millions)]}
+```
+Each message allocates role string, content string, and the `chat_msg` struct. With 1M messages, heap usage is ~100+ MiB for a ~20 MiB JSON input.
+
+**Exploitability: MEDIUM** (bounded by 64 MiB input, but amplification factor is significant).
+
+**Recommendation:** Impose reasonable limits on array sizes (e.g., max 10,000 messages, max 1,000 tools, max 100 stop sequences).
+
+---
+
+### 7. Lone UTF-16 Surrogates Encoded as Invalid UTF-8
+
+**Severity: MEDIUM**
+**Location:** Lines 235–243 (`json_string`) and lines 183–199 (`utf8_put`)
+
+```c
+case 'u': {
+    *p -= 2;
+    uint32_t cp = 0, lo = 0;
+    if (!json_u16(p, &cp)) goto fail;
+    if (cp >= 0xd800 && cp <= 0xdbff && json_u16(p, &lo) && lo >= 0xdc00 && lo <= 0xdfff) {
+        cp = 0x10000u + ((cp - 0xd800u) << 10) + (lo - 0xdc00u);
+    }
+    utf8_put(&b, cp);
+    break;
+}
+```
+
+**Description:**
+When a high surrogate (0xD800–0xDBFF) is not followed by a low surrogate, or when a low surrogate (0xDC00–0xDFFF) appears alone, the raw surrogate codepoint is passed to `utf8_put`, which encodes it as a 3-byte CESU-8 / WTF-8 sequence (ED A0 80 – ED BF BF). This is explicitly forbidden by the Unicode standard (surrogates are not valid scalar values) and produces bytes that are invalid UTF-8 per RFC 3629.
+
+These invalid sequences propagate into the model prompt text and may:
+- Cause the tokenizer to produce unexpected token sequences
+- Corrupt KV cache prefix matching (a later client that properly escapes the same text will produce different bytes, breaking cache alignment)
+- Trigger undefined behavior in downstream string processing that assumes valid UTF-8
+
+**Attack path:**
+```json
+{"messages":[{"role":"user","content":"hello \uD800 world"}]}
+```
+The lone `\uD800` is encoded as ED A0 80, producing an invalid UTF-8 string used as the model prompt. If the tokenizer has assertions on valid UTF-8, this may crash. If it silently accepts it, the result is at least a cache-alignment problem.
+
+**Exploitability: MEDIUM** (easy to trigger via any API endpoint that accepts string content).
+
+**Recommendation:** Reject lone surrogates in `json_string`, or replace them with U+FFFD:
+```c
+if (cp >= 0xd800 && cp <= 0xdfff) goto fail; // reject
+```
+
+---
+
+### 8. `content_length` — `strtol` on Non-NUL-Bounded Slice
+
+**Severity: LOW–MEDIUM**
+**Location:** Line 10998
+
+```c
+return strtol(v, NULL, 10);
+```
+
+**Description:**
+`strtol` reads from `v` until it encounters a non-digit character. The pointer `v` points into the `buf b` which *is* NUL-terminated by `buf_append`, so in practice `strtol` will stop at `\r`, `\n`, or `\0`. However, the function conceptually operates on `line + 15` to `line + len`, and `strtol` may read past `line + len` if the line content is all digits with no trailing CR/LF. This is safe only because the buffer is always NUL-terminated by `buf_append` — a fragile invariant.
+
+Additionally, `strtol` does not validate that *only* digits follow the whitespace. A header like `Content-Length: 10abc` would return 10 without error. While not exploitable on its own, it violates RFC strictness and could interact with proxies that parse the same header differently.
+
+**Exploitability: LOW** (mitigated by NUL-termination invariant of `buf`).
+
+**Recommendation:** Use a bounded parsing approach, e.g., `strtol` with `end` pointer validation, or manually parse the digits within the `[v, line+len)` range.
 
 ---
 
 ## Summary Table
 
-| # | Severity | Category | Location | Description |
-|---|----------|----------|----------|-------------|
-| 1 | MEDIUM | DoS / Resource Exhaustion | L1838,1868 | Unbounded n_kv/n_tensors calloc from GGUF header |
-| 2 | MEDIUM | DoS / CPU Hang | L20420 | `next_pow2` infinite loop via GGUF merges.len overflow |
-| 3 | MEDIUM | Symlink Attack | L21879 | `/tmp/ds4.lock` follows symlinks; arbitrary file truncation |
-| 4 | MEDIUM | Info Disclosure | L22895 | Session payload in world-writable `/tmp` |
-| 5 | LOW-MEDIUM | Integer Overflow | L20673 | `bpe_rank` length calc can overflow on 32-bit |
-| 6 | MEDIUM | Error Handling | L10849 | GPU alloc failures not checked individually |
-| 7 | LOW-MEDIUM | Div-by-Zero | L1498 | `align_up` has no zero-alignment guard |
-| 8 | MEDIUM | Process Crash DoS | L25660 | Out-of-range token ID kills server via `ds4_die` |
+| # | Issue | Severity | Exploitability | Category |
+|---|-------|----------|----------------|----------|
+| 1 | `buf_reserve` cap-doubling integer overflow | MEDIUM | Low (64-bit) / Medium (32-bit) | Memory Safety |
+| 2 | Duplicate `Content-Length` first-match semantics | MEDIUM | Medium (needs proxy) | Request Smuggling |
+| 3 | Missing `Transfer-Encoding` handling | MEDIUM | Medium (needs proxy) | Request Smuggling |
+| 4 | `strtod` accepts NaN/Inf/hex floats | MEDIUM | Medium | Type Confusion / DoS |
+| 5 | Unbounded client thread creation | MEDIUM | High | DoS |
+| 6 | Unbounded JSON array sizes | MEDIUM | Medium | DoS |
+| 7 | Lone UTF-16 surrogates → invalid UTF-8 | MEDIUM | Medium | Memory Safety / Data Integrity |
+| 8 | `strtol` on non-bounded header value | LOW–MEDIUM | Low | Parsing Robustness |
 
----
+## Positive Observations
 
-## Areas Reviewed Without Significant Findings
+Several security-relevant areas are handled well:
 
-### GGUF Tensor Offset Validation (GOOD)
-Lines 1904–1912 properly check for both addition overflow and bounds:
-```c
-if (t->rel_offset > UINT64_MAX - m->tensor_data_pos)
-    ds4_die("tensor offset overflow");
-t->abs_offset = m->tensor_data_pos + t->rel_offset;
-if (t->bytes != 0 &&
-    (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset))
-    ds4_die("tensor points outside GGUF file");
-```
-
-### Tensor Element Count Overflow (GOOD)
-Line 1883 checks for multiplication overflow before computing element count:
-```c
-if (t->dim[d] != 0 && t->elements > UINT64_MAX / t->dim[d])
-    ds4_die("tensor element count overflow");
-```
-
-### Tensor Byte Count Overflow (GOOD)
-Line 1687 in `tensor_nbytes` checks for overflow:
-```c
-if (blocks > UINT64_MAX / info->block_bytes) return false;
-```
-
-### GGUF Metadata Array Nesting (GOOD)
-Line 1633 limits recursion depth to prevent stack overflow:
-```c
-if (depth > 8) { cursor_error(c, "metadata array nesting is too deep"); return false; }
-```
-
-### Cursor Bounds Checking (GOOD)
-The `cursor_has` function (line 1459) correctly prevents integer overflow in
-the bounds check by restructuring the comparison:
-```c
-if (n > c->size || c->pos > c->size - n) // avoids pos+n overflow
-```
-
-### Session Payload Validation (GOOD)
-`ds4_session_load_payload` validates magic, version, layout parameters, and
-remaining byte count.  Compressed/raw row counts are bounds-checked against
-capacity before being used to size reads.
-
-### Tokenizer BPE (GOOD)
-The BPE implementation uses dynamic arrays with `xrealloc` (which aborts on
-OOM) and operates on heap-allocated `owned_str` values, avoiding stack buffer
-overflows.
-
-### Mmap Region Size (GOOD)
-The mmap uses `fstat` to determine file size and maps exactly that many bytes.
-The cursor abstraction prevents reads beyond the mapped region.
-
----
-
-## Threat Model Notes
-
-The primary untrusted-input surface is **GGUF model files**.  Users commonly
-download GGUF files from model-sharing platforms (Hugging Face, etc.), and a
-malicious model file is the most realistic attack vector.  Findings 1, 2, 5,
-and 7 are in this attack surface.
-
-The secondary surface is **API requests** to the ds4 HTTP server, where
-crafted token IDs or prompts can trigger crashes (Finding 8).
-
-The tertiary surface is **local system access** for the lock file and temp
-file issues (Findings 3 and 4).
+- **Header size limits:** `max_header = 64 * 1024` prevents unbounded header reading.
+- **Body size limits:** `max_body = 64 * 1024 * 1024` caps request bodies.
+- **`sscanf` field widths:** `%7s` and `%255s` match the fixed buffer sizes (8 and 256 bytes).
+- **JSON nesting depth:** `JSON_MAX_NESTING = 256` prevents stack exhaustion from deeply nested JSON.
+- **Error message sanitization:** All error messages pass through `json_escape` before being included in HTTP responses, preventing JSON injection.
+- **Tool memory bounds:** `DS4_TOOL_MEMORY_MAX_BYTES` and `max_entries` limit memory growth.
+- **Mutex discipline:** The `tool_mu` mutex is consistently used for all `tool_memory` and `live_tool_state` accesses from client threads. The worker thread is single-threaded, avoiding races on `session`/`engine` state.
+- **Send timeout:** `DS4_SERVER_SEND_STALL_TIMEOUT_MS` prevents slow clients from blocking the worker indefinitely.
+- **I/O timeouts:** `SO_RCVTIMEO` / `SO_SNDTIMEO` are set on client sockets.
+- **Connection: close:** Every response includes `Connection: close`, mitigating persistent-connection-based attacks (though not request-side smuggling).
