@@ -1,378 +1,451 @@
-# Security Audit: ds4_kvstore.c / ds4_kvstore.h
+# DS4 Inference Engine Security Audit
 
-**Auditor:** Automated Security Review  
+**Scope:** `ds4.c` and `ds4.h` — the core ~26k-line inference engine  
 **Date:** 2026-06-26  
-**Scope:** `ds4_kvstore.c`, `ds4_kvstore.h`, with cross-references to `ds4.c` for payload staging  
-**Branch:** `cursor/at-rest-security-review-753a`
+**Severity threshold:** MEDIUM and above  
 
 ---
 
-## Finding 1 — Plaintext Sensitive Data at Rest (HIGH)
+## Executive Summary
 
-**Files:** `ds4_kvstore.c:1058`, `ds4_kvstore.c:1085-1091`  
-**Category:** Data at rest / Confidentiality
+The DS4 inference engine demonstrates generally good defensive coding for a
+C codebase of this size.  GGUF parsing uses a bounded cursor abstraction that
+prevents most reads beyond the mmap, tensor offsets are validated against the
+file size, and integer overflow is checked in several critical size calculations.
 
-### Description
-
-KV cache files written to disk contain the full rendered prompt text in plaintext
-(line 1087: `fwrite(text, 1, text_len, fp)`), followed by a raw binary payload of
-the session's internal KV state. The text portion includes the complete
-conversation history — system prompts, user messages, assistant responses, and
-any tool-call results or tokens embedded in the prompt.
-
-There is no encryption, MAC, or authenticated-encryption envelope. The cache
-directory is created with `0700` permissions (`kv_mkdir_p`, line 361/367), but
-individual files are created via `fopen(tmp, "wb")` (line 1058), which applies
-the process umask. If the umask is `0022` (common default), files are created
-`0644` (world-readable).
-
-### Exploitability
-
-**HIGH.** Any local user with read access to the cache directory can:
-1. Read all cached prompt text verbatim from the `.kv` files (the text starts at
-   a fixed offset: `DS4_KVSTORE_FIXED_HEADER + 4` = byte 52).
-2. Extract API tokens, secrets, or PII that appeared anywhere in the prompt.
-3. The file format is trivial to parse — magic bytes `KVC\x01`, then a 48-byte
-   header, a 4-byte little-endian text length, then that many bytes of plaintext.
-
-### Recommendation
-
-- Set the umask or use `open(path, O_WRONLY|O_CREAT|O_EXCL, 0600)` + `fdopen()`
-  to ensure cache files are created with `0600` permissions.
-- Consider encrypting the text and payload portions with an authenticated cipher
-  (e.g., XChaCha20-Poly1305) keyed to the running user/service.
+However, the audit identified **8 findings at MEDIUM severity or higher**.  The
+most impactful are related to GGUF file parsing (the primary untrusted-input
+surface), the instance lock file, and potential memory-exhaustion denial-of-service
+through unchecked allocation sizes derived from attacker-controlled GGUF header
+fields.
 
 ---
 
-## Finding 2 — Cache Files Created Without Restrictive Permissions (HIGH)
+## Findings
 
-**File:** `ds4_kvstore.c:1058`  
-**Category:** File permissions
+### FINDING 1 — GGUF metadata/tensor count can trigger memory-exhaustion DoS
 
-### Description
+**File:** `ds4.c`  
+**Lines:** 1838, 1868, 1960–1961  
+**Severity:** MEDIUM  
+**Category:** Denial of Service / Resource Exhaustion  
+
+**Description:**  
+`n_kv` and `n_tensors` are read as raw `uint64_t` values from the GGUF header
+and used directly as allocation counts:
 
 ```c
-FILE *fp = fopen(tmp, "wb");   // line 1058
+// line 1838
+m->kv = calloc((size_t)m->n_kv, sizeof(m->kv[0]));
+
+// line 1868
+m->tensors = calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
 ```
 
-`fopen` with mode `"wb"` does not allow specifying the file creation mode.
-The resulting permissions are `0666 & ~umask`. With the common default umask of
-`0022`, the temp file is created as `0644` — readable by every user on the
-system. After `rename(tmp, path)` (line 1107), the final `.kv` file retains
-those permissions.
+A crafted GGUF file can set `n_kv` or `n_tensors` to a very large value (e.g.
+`2^60`).  The `calloc` will attempt to allocate an enormous amount of memory.
+While `calloc` may return `NULL` (handled by `ds4_die`), on Linux with
+overcommit enabled, the allocation may succeed but later cause OOM-killer
+invocations or swap thrashing, effectively denying service to the entire
+machine.
 
-Similarly, `ds4_kvstore_touch_file` (line 486) and `kv_cache_rewrite_trailer`
-(line 893) open existing files with `fopen(path, "r+b")` — this does not modify
-permissions, but if the file was originally created world-readable it remains so.
+There is no upper-bound check that `n_kv` or `n_tensors` is reasonable
+relative to the file size.  For example, each metadata KV entry requires at
+minimum ~13 bytes (key-length prefix + type + smallest value), so `n_kv`
+cannot exceed `file_size / 13`.
 
-The cache directory itself is created with `0700` (lines 361, 367), which blocks
-traversal for other users. However, if the directory already exists with looser
-permissions (e.g., manually created or set by a deployment script), the code does
-not tighten them.
+**Exploitability:** An attacker supplies a malicious GGUF model file.  This
+is the primary untrusted-input surface.  Any user or operator who downloads a
+GGUF from an untrusted source (model-sharing sites, p2p, etc.) is affected.
 
-### Exploitability
-
-**HIGH** in shared-machine or container-escape scenarios. The directory mode
-provides a partial mitigation, but relying solely on directory permissions is
-fragile — a single misconfiguration exposes all cached data.
-
-### Recommendation
-
-- Use `open(tmp, O_WRONLY|O_CREAT|O_EXCL, 0600)` followed by `fdopen(fd, "wb")`
-  for all file-creation paths.
-- After `kv_mkdir_p`, verify the directory mode with `stat()` and `chmod()` to
-  `0700` if it differs, or fail with a clear error.
-
----
-
-## Finding 3 — No Symlink Attack Protection (MEDIUM)
-
-**Files:** `ds4_kvstore.c:1058`, `ds4_kvstore.c:1107`, `ds4_kvstore.c:448`,
-`ds4_kvstore.c:486`, `ds4_kvstore.c:817`, `ds4_kvstore.c:893`, `ds4_kvstore.c:1237`  
-**Category:** Symlink / link-following attacks
-
-### Description
-
-Every `fopen()` call in the kvstore follows symlinks. An attacker who can create
-a symlink at the expected cache path (or the `.tmp.<pid>` intermediate) can:
-
-1. **Read arbitrary files:** Place a symlink at
-   `<cache_dir>/<sha>.kv` pointing to `/etc/shadow` or another sensitive file.
-   When `ds4_kvstore_try_load_text` opens it and reads `text_bytes` of data
-   (line 1256), the contents of the target file are loaded into memory and
-   processed.
-
-2. **Write/overwrite arbitrary files:** The temp file path is
-   `<cache_dir>/<sha>.kv.tmp.<pid>` (line 1055). If an attacker can predict the
-   PID and SHA (the SHA is deterministic from prompt text), they can pre-create a
-   symlink at that path. The `fopen(tmp, "wb")` (line 1058) will follow the
-   symlink and overwrite the target. The `rename(tmp, path)` (line 1107) then
-   replaces the symlink with a regular file, but the damage (truncation of the
-   target) is already done.
-
-3. **Eviction unlink as targeted deletion:** `unlink(e.path)` at line 589
-   follows the directory entry; if `e.path` was scanned from a directory listing
-   containing a symlink, `unlink` removes the symlink itself (not its target),
-   but `ds4_kvstore_read_entry_file` at line 448 uses `stat()` (which follows
-   symlinks) to validate the entry, so a carefully crafted symlink to a valid KV
-   file elsewhere could cause the wrong entry's metadata to be trusted.
-
-### Exploitability
-
-**MEDIUM.** Requires the attacker to be able to write into the cache directory.
-The `0700` directory creation mitigates this for new directories, but does not
-protect against:
-- A pre-existing directory with looser permissions.
-- A shared `/tmp`-based cache path.
-- A compromised co-process running as the same user.
-
-### Recommendation
-
-- Use `O_NOFOLLOW` on all `open()` calls for cache files.
-- Use `openat()` relative to a directory fd obtained with `O_NOFOLLOW|O_DIRECTORY`.
-- Use `lstat()` instead of `stat()` in `ds4_kvstore_read_entry_file` (line 445).
-- Use `renameat()` with `RENAME_NOREPLACE` where available.
-
----
-
-## Finding 4 — TOCTOU Race in File Creation (MEDIUM)
-
-**File:** `ds4_kvstore.c:997-1058`  
-**Category:** Race conditions
-
-### Description
-
-The store path has a classic check-then-act race:
-
-1. `kv_cache_existing_compatible()` (line 997) calls `access(path, F_OK)` (via
-   line 847), then reads the file to check compatibility.
-2. If the file does not exist or is incompatible, the code proceeds to create a
-   new temp file and `rename()` it into place.
-3. Between step 1 and step 2, another process (or another thread in a
-   multi-session server) could create the same file.
-
-The `rename()` at line 1107 is atomic on POSIX, so the final state is
-consistent, but:
-- The losing writer wastes CPU/IO serializing the payload.
-- If the winning writer wrote a *different* text (SHA collision — see Finding 7),
-  the loser's `rename()` silently replaces it.
-
-Additionally, `ds4_kvstore_touch_file` (line 486) does a read-modify-write of
-the header without any file locking, so concurrent callers can lose hit-count
-updates.
-
-### Exploitability
-
-**MEDIUM** in multi-process server deployments sharing a cache directory. Mostly
-a reliability/data-integrity issue rather than a confidentiality breach, but
-combined with Finding 7 it could be used to inject a crafted cache file.
-
-### Recommendation
-
-- Use advisory locking (`flock` or `fcntl`) around the write-and-rename
-  sequence.
-- Use `O_EXCL` when creating the temp file to detect races.
-- Use `flock` in `ds4_kvstore_touch_file` for the read-modify-write cycle.
-
----
-
-## Finding 5 — SHA-1 Collision Allows Cache Poisoning (MEDIUM)
-
-**Files:** `ds4_kvstore.c:215-328` (SHA-1 implementation),
-`ds4_kvstore.c:992-993`, `ds4_kvstore.c:1208-1210`  
-**Category:** Cryptographic weakness
-
-### Description
-
-Cache file naming and lookup rely entirely on SHA-1 of the prompt text prefix:
+**Recommendation:**  
+Add sanity checks after parsing the GGUF header:
 
 ```c
-ds4_kvstore_sha1_bytes_hex(text, text_len, sha);        // line 993
-char *path = ds4_kvstore_path_for_sha(kc, sha);         // line 994
+if (m->n_kv > m->size / 13 || m->n_tensors > m->size / 16)
+    ds4_die("GGUF header claims more metadata/tensors than the file could hold");
 ```
 
-SHA-1 is cryptographically broken — practical chosen-prefix collision attacks
-exist (SHAttered, 2017; Shambles, 2020). An attacker who controls part of the
-prompt text can construct two distinct prompts that hash to the same SHA-1,
-causing:
-
-1. **Cache poisoning:** Attacker stores a cache entry under a colliding hash.
-   When a victim's prompt resolves to the same hash, `ds4_kvstore_find_text_prefix`
-   (line 1208-1210) matches by SHA only, and `ds4_kvstore_try_load_text` loads
-   the attacker's payload. The byte-prefix verification at line 1266-1268
-   provides a second check, but a chosen-prefix collision produces matching
-   prefixes for the colliding portion.
-
-2. **Cache replacement:** Two legitimately different prompts that collide cause
-   silent overwrites, since the `rename()` path replaces any existing file with
-   the same SHA-derived name.
-
-### Exploitability
-
-**MEDIUM.** A chosen-prefix SHA-1 collision costs roughly $45k-$75k in GPU time
-(2020 estimates, likely cheaper now). This is out of reach for casual attackers
-but feasible for well-resourced adversaries targeting high-value inference
-pipelines. The practical barrier is also lowered because the attacker only needs
-a prefix collision — the suffix can differ.
-
-The code does perform a byte-prefix match after the SHA lookup (line 1266), which
-acts as a partial second barrier. However, in a chosen-prefix collision scenario,
-the attacker controls the matching prefix bytes.
-
-### Recommendation
-
-- Migrate to SHA-256 or BLAKE3 for cache keying. The hash is only used for file
-  naming and lookup — performance is not a concern.
-- As a defense-in-depth measure, store the full text length in the filename or
-  a secondary index.
-
 ---
 
-## Finding 6 — Insufficient Deserialization Validation on Load (MEDIUM)
+### FINDING 2 — `next_pow2` infinite loop on large hash table sizes from crafted GGUF
 
-**Files:** `ds4_kvstore.c:1245-1281`, `ds4.c:23146-23196`  
-**Category:** Deserialization / Untrusted input
+**File:** `ds4.c`  
+**Lines:** 20420–20424, 20427  
+**Severity:** MEDIUM  
+**Category:** Denial of Service (CPU hang)  
 
-### Description
-
-When loading a cache file, `ds4_kvstore_try_load_text` performs header
-validation (magic, version, ABI, model_id, text prefix match) and then calls
-`ds4_session_load_payload(session, fp, hdr.payload_bytes, ...)` (line 1277).
-
-The payload loader in `ds4.c` (line 23146+) does check the payload magic,
-version, architectural constants (`DS4_N_LAYER`, `DS4_N_HEAD_DIM`, etc.), and
-context-size bounds. However:
-
-1. **`payload_bytes` is trusted from the file header** (line 434:
-   `e->payload_bytes = kv_le_get64(h + 40)`). A corrupted or malicious file can
-   set `payload_bytes` to any 64-bit value. The payload loader reads exactly
-   `payload_bytes` worth of data. If `payload_bytes` is larger than the actual
-   file, `fread` will return short and the loader should detect this — but if
-   `payload_bytes` is crafted to be *smaller* than the real payload, the loader
-   stops early, leaving the file pointer at an attacker-controlled position for
-   subsequent trailer parsing.
-
-2. **Trailer hooks parse data after the payload** (line 1291-1293). The trailer
-   `load` callback receives an `fp` at whatever position the payload loader left
-   it. If `payload_bytes` was manipulated, the trailer parser reads
-   attacker-controlled bytes as structured data. The severity depends on the
-   trailer hook implementation (external to this file), but the kvstore layer
-   does not validate that the file pointer is at the expected position after
-   payload load.
-
-3. **`text_bytes` (uint32_t from file)** controls a heap allocation at line 1255:
-   `cached_text = kv_xmalloc((size_t)text_bytes + 1)`. A malicious file with
-   `text_bytes = 0xFFFFFFFF` causes a 4 GiB allocation. While this is a
-   denial-of-service rather than code execution, it can OOM-kill the process.
-   The only guard is the earlier `st.st_size` check in
-   `ds4_kvstore_read_entry_file`, which is not performed in the load path
-   (`ds4_kvstore_try_load_text` re-reads the header from the already-opened
-   file without rechecking file size).
-
-### Exploitability
-
-**MEDIUM.** Requires the attacker to place a crafted `.kv` file in the cache
-directory (possible via Finding 3 or 4, or if the cache dir has loose
-permissions). The OOM vector is straightforward; the trailer-confusion vector
-depends on hook implementations.
-
-### Recommendation
-
-- After `ds4_session_load_payload` returns, verify `ftell(fp)` matches the
-  expected position (`header_size + 4 + text_bytes + payload_bytes`).
-- Validate `text_bytes` against the file size before allocating:
-  `if (text_bytes > st.st_size - DS4_KVSTORE_FIXED_HEADER - 4) return false;`
-- Consider adding a whole-file HMAC or checksum that is verified before any
-  parsing.
-
----
-
-## Finding 7 — Temp File Path Predictable (MEDIUM)
-
-**File:** `ds4_kvstore.c:1054-1056`  
-**Category:** Predictable temp file
-
-### Description
+**Description:**  
+The `next_pow2` function uses a left-shift loop:
 
 ```c
-kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
+static uint64_t next_pow2(uint64_t n) {
+    uint64_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
 ```
 
-The temporary file path is `<cache_dir>/<sha>.kv.tmp.<pid>`. Both the SHA (a
-deterministic hash of prompt text) and the PID are predictable to a local
-attacker:
-- The PID can be enumerated from `/proc`.
-- The SHA can be computed if the attacker knows or can guess the prompt text.
+`table_init` calls it with `expected * 2 + 16`:
 
-This enables a pre-creation attack: the attacker creates a symlink (or a file)
-at the predicted temp path before the victim process opens it. Since `fopen(tmp,
-"wb")` does not use `O_EXCL`, it will silently open the existing file (or follow
-a symlink).
+```c
+static void table_init(str_i32_table *t, uint64_t expected) {
+    t->cap = next_pow2(expected * 2 + 16);
+```
 
-### Exploitability
+If a malicious GGUF declares a tokenizer with `tokens.len` close to
+`UINT64_MAX / 2` (the `len` field is a uint64 read from GGUF metadata), then
+`expected * 2 + 16` wraps around to a small value or `expected * 2` itself
+overflows.  Additionally, if `expected * 2 + 16 > 2^63`, the `next_pow2`
+loop will shift `p` through `2^63` (which is `INT64_MIN` as signed, but as
+`uint64_t` is fine), then to `0` via overflow, and then loop forever
+(`0 < n` is always true for any `n > 0`).
 
-**MEDIUM.** Requires local access and ability to write to the cache directory
-(same constraints as Finding 3). In containerized deployments with shared
-volumes, this is realistic.
+**Attack path:** The `tokens.len` and `merges.len` fields are uint64 values
+read from the GGUF tokenizer arrays.  While `tokens.len` is bounded by
+`INT32_MAX` (line 20952), `merges.len` has no upper bound check (line 20955–20958).
 
-### Recommendation
+**Exploitability:** A crafted GGUF with a large `merges.len` causes a CPU
+hang during model load.  The process becomes unresponsive.
 
-- Use `mkstemp()` or `open(tmp, O_WRONLY|O_CREAT|O_EXCL, 0600)` to create temp
-  files with guaranteed uniqueness and no symlink following.
-- Alternatively, include a random suffix (e.g., from `getrandom()`) instead of
-  the PID.
+**Recommendation:**  
+1. Add a bounds check on `merges.len` similar to `tokens.len`.
+2. Use bit manipulation instead of a loop: `p = 1ULL << (64 - __builtin_clzll(n - 1))` with appropriate edge-case guards.
 
 ---
 
-## Finding 8 — Staged Payload Uses World-Readable /tmp (MEDIUM)
+### FINDING 3 — `/tmp/ds4.lock` symlink attack (local privilege escalation / DoS)
 
-**File:** `ds4.c:22895-22896`  
-**Category:** Data at rest / temp file exposure
+**File:** `ds4.c`  
+**Lines:** 21879–21921  
+**Severity:** MEDIUM  
+**Category:** TOCTOU / Symlink attack  
 
-### Description
+**Description:**  
+The instance lock file defaults to `/tmp/ds4.lock`, a world-writable directory:
+
+```c
+const char *path = getenv("DS4_LOCK_FILE");
+if (!path || !path[0]) path = "/tmp/ds4.lock";
+
+const int fd = open(path, O_RDWR | O_CREAT, 0600);
+```
+
+The `open()` call follows symlinks.  A local attacker can create a symlink at
+`/tmp/ds4.lock` pointing to an arbitrary file (e.g. `/etc/crontab`, a user's
+`.bashrc`, or a critical system file).  When DS4 runs (potentially as a
+different user, or as root in some deployment configurations), it will:
+
+1. Open the target file via the symlink with `O_RDWR | O_CREAT`.
+2. Call `ftruncate(fd, 0)` (line 21913), **destroying the target file's contents**.
+3. Write `dprintf(fd, "%ld\n", (long)getpid())` into the file.
+
+This is a classic `/tmp` symlink race.  Even if the attacker cannot escalate
+privileges, they can cause denial of service by pointing the symlink at DS4's
+own model file or other critical data.
+
+**Exploitability:** Requires local access to the `/tmp` directory on the same
+machine.  Exploitable in any multi-user or containerized environment where DS4
+runs.  The `DS4_LOCK_FILE` environment variable override does not help since
+the default is always `/tmp`.
+
+**Recommendation:**  
+Use `O_NOFOLLOW` to prevent following symlinks, and create the file in a
+user-owned directory (e.g. `$XDG_RUNTIME_DIR` or `$HOME/.ds4/`):
+
+```c
+const int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+```
+
+Or use a directory under `/run/user/$(id -u)/` which is per-user and not
+world-writable.
+
+---
+
+### FINDING 4 — `/tmp/ds4-session-payload.XXXXXX` temp file in world-writable directory
+
+**File:** `ds4.c`  
+**Lines:** 22895–22900  
+**Severity:** MEDIUM  
+**Category:** Information Disclosure / Symlink attack  
+
+**Description:**  
+Session payloads are staged through a temporary file in `/tmp`:
 
 ```c
 char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
 int fd = mkstemp(tmpl);
 ```
 
-The session payload (full KV cache state including embedded prompt data) is
-staged to a file in `/tmp`. While `mkstemp()` creates the file with `0600`
-permissions, the file exists in a world-traversable directory. On systems with
-`/tmp` on a shared filesystem, or in container environments where `/tmp` is
-bind-mounted, other processes may be able to observe the file's existence and
-race to open it between creation and first write.
+While `mkstemp` itself is safe against symlink races (it creates the file
+with `O_EXCL`), the predictable prefix `ds4-session-payload` in a
+world-readable directory creates two risks:
 
-More critically, `mkstemp` creates the file with `0600` but the `fdopen` call
-on line 22901 does not re-verify permissions, and the file persists on disk
-(potentially containing gigabytes of session state) until
-`ds4_session_payload_file_free` calls `unlink` — which may be significantly
-later.
+1. **Information disclosure:** The session payload contains the full KV cache,
+   logits, and token history.  On some systems, the file permissions from
+   `mkstemp` may inherit a permissive umask (the mask is applied to `0600`,
+   but some environments override this).  A local attacker can monitor `/tmp`
+   for new files matching the pattern.
 
-### Exploitability
+2. **Temp file exhaustion DoS:** An attacker can pre-create many files matching
+   the `XXXXXX` pattern space to cause `mkstemp` to fail.
 
-**MEDIUM.** The `mkstemp` + `0600` permissions make direct reads difficult, but
-the predictable `/tmp` prefix aids targeted attacks on shared systems. The
-payload file can be very large and long-lived.
+**Attack path:** Local attacker on the same machine monitors `/tmp` for session
+payload files.  The payload contains the user's conversation tokens, which may
+include sensitive prompts.
 
-### Recommendation
+**Recommendation:**  
+Use a private directory (e.g. under `$TMPDIR`, `$XDG_RUNTIME_DIR`, or a
+subdirectory created by the server with restricted permissions).
 
-- Use a private temp directory under the cache dir (already `0700`) instead of
-  `/tmp`.
-- Consider using `O_TMPFILE` on Linux to create an unnamed temp file that never
-  appears in the directory listing.
+---
+
+### FINDING 5 — Integer overflow in `bpe_rank` length calculation
+
+**File:** `ds4.c`  
+**Lines:** 20673–20676  
+**Severity:** LOW-MEDIUM  
+**Category:** Integer Overflow / Heap Buffer Overflow  
+
+**Description:**  
+The `bpe_rank` function computes a concatenated key length:
+
+```c
+static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str *b) {
+    uint64_t len = a->len + 1 + b->len;
+    char stack[512];
+    char *buf = len <= sizeof(stack) ? stack : xmalloc((size_t)len);
+
+    memcpy(buf, a->ptr, (size_t)a->len);
+    buf[a->len] = ' ';
+    memcpy(buf + a->len + 1, b->ptr, (size_t)b->len);
+```
+
+If `a->len + 1 + b->len` overflows `uint64_t` (theoretically requires
+>= 2^63 sized strings), or more practically if the `(size_t)` cast truncates
+on a 32-bit platform, the allocated buffer could be smaller than expected,
+causing a heap buffer overflow.
+
+In practice, `a` and `b` are `owned_str` values derived from `byte_encode`
+which allocates `in.len * 4 + 1` bytes (line 20640).  The `in.len` comes
+from the GGUF-declared token strings.  On a 64-bit platform, overflow requires
+impractically large token strings, but the code lacks an explicit guard.
+
+**Exploitability:** Very difficult on 64-bit.  Could matter on 32-bit
+platforms if the engine is ever ported.
+
+**Recommendation:**  
+Add an overflow check: `if (a->len > SIZE_MAX - b->len - 1) ds4_die(...)`.
+
+---
+
+### FINDING 6 — GPU allocation failures are silently aggregated, not individually reported
+
+**File:** `ds4.c`  
+**Lines:** 10849–10997, 11054–11097  
+**Severity:** MEDIUM  
+**Category:** Insufficient Error Handling / Undefined Behavior  
+
+**Description:**  
+The `metal_graph_alloc_raw_cap` function performs approximately 80+ GPU tensor
+allocations sequentially.  Each `ds4_gpu_tensor_alloc()` call may return `NULL`
+on failure, but the results are not checked individually.  Instead, all
+allocations proceed, and a single aggregate NULL check happens at the end
+(lines 11054–11097):
+
+```c
+const bool ok = state_init_ok && layer_cache_ok &&
+                g->cur_hc && g->flat_hc && g->hc_mix && ...
+```
+
+**Problems with this approach:**
+
+1. **NULL pointer dereference between allocations:** Between lines 10849 and
+   11054, several operations use earlier allocations that may have returned
+   NULL.  For example, `ds4_gpu_tensor_view` (lines 10853–10859) is called on
+   `g->hc_split` which may be NULL.  Similarly, `metal_tensor_fill_f32`
+   (line 10891) is called on tensors that may be NULL — though it does check
+   `if (g->layer_attn_state_kv[il])`.
+
+2. **Partial GPU state on failure:** If the aggregate check fails at line 11097,
+   `metal_graph_free` is called, which must correctly handle a mix of NULL and
+   non-NULL tensors.
+
+3. **Silent failure mode:** The caller (`ds4_session_create`) gets a boolean
+   `false` return with no diagnostic about which allocation failed or how much
+   GPU memory was available.
+
+**Attack path:** An attacker cannot directly control GPU memory pressure in most
+deployment models, but in shared-GPU environments (cloud inference, multi-tenant
+setups), a co-tenant could exhaust GPU memory to trigger this path.
+
+**Recommendation:**  
+Check each allocation immediately and return with a diagnostic error on the
+first failure.  This also avoids wasting GPU memory on subsequent allocations
+that will be freed anyway.
+
+---
+
+### FINDING 7 — GGUF `general.alignment` can be set to zero (division in `align_up`)
+
+**File:** `ds4.c`  
+**Lines:** 1498–1501, 1854–1858  
+**Severity:** LOW-MEDIUM  
+**Category:** Division by Zero / Undefined Behavior  
+
+**Description:**  
+The `align_up` function computes a modulo:
+
+```c
+static uint64_t align_up(uint64_t value, uint64_t alignment) {
+    uint64_t rem = value % alignment;
+    return rem == 0 ? value : value + alignment - rem;
+}
+```
+
+The `general.alignment` metadata value is used as the alignment for tensor
+data:
+
+```c
+if (cursor_u32(&tmp, &alignment) && alignment != 0) {
+    m->alignment = alignment;
+}
+```
+
+While the zero check (line 1856) guards the initial assignment, the default
+`m->alignment = 32` (line 1841) means a zero value in the GGUF just keeps
+the default.  However, `align_up` itself has no guard against a zero
+`alignment` argument.  If any other code path calls `align_up` with a zero
+divisor, undefined behavior (division by zero) occurs.
+
+**Exploitability:** Currently low because the alignment assignment is guarded.
+This is a latent risk if `align_up` is reused elsewhere.
+
+**Recommendation:**  
+Add `if (alignment == 0) return value;` at the top of `align_up`.
+
+---
+
+### FINDING 8 — Token ID bounds not checked in `ds4_session_eval` path
+
+**File:** `ds4.c`  
+**Lines:** 25569–25602, 25660  
+**Severity:** MEDIUM  
+**Category:** Out-of-Bounds Memory Access  
+
+**Description:**  
+The `ds4_session_eval` function accepts an arbitrary `int token` from the
+caller and passes it directly through to the forward pass.  While the
+embedding function `embed_token_f16` (line 4295–4299) does check bounds:
+
+```c
+static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float *out) {
+    ds4_tensor *te = w->token_embd;
+    if (token < 0 || (uint64_t)token >= te->dim[1]) {
+        ds4_die("token id is outside the embedding table");
+    }
+```
+
+This check calls `ds4_die` which terminates the entire process.  For a server
+deployment (ds4-server), a single malicious API request with an out-of-range
+token ID kills the server process, denying service to all other clients.
+
+The `ds4_session_eval` public API (line 25660) does not validate the token
+range itself, relying on the fatal `ds4_die` inside the forward pass.
+
+Similarly, `ds4_session_sync` passes caller-provided token arrays into the
+prefill path.  Any out-of-range token in the prompt triggers a fatal abort
+rather than a recoverable error.
+
+**Attack path:** An attacker sends an API request (e.g. via the HTTP server)
+with a crafted token ID outside `[0, n_vocab)`.  The server process crashes.
+
+**Recommendation:**  
+1. Check token bounds in `ds4_session_eval` and `ds4_session_sync` before
+   entering the forward pass, returning an error code instead of aborting.
+2. Change `embed_token_f16` to return an error rather than calling `ds4_die`.
 
 ---
 
 ## Summary Table
 
-| # | Finding | Severity | Category |
-|---|---------|----------|----------|
-| 1 | Plaintext sensitive data in cache files | HIGH | Confidentiality |
-| 2 | Files created without 0600 permissions | HIGH | File permissions |
-| 3 | No symlink protection on file operations | MEDIUM | Symlink attacks |
-| 4 | TOCTOU race in file creation/compatibility check | MEDIUM | Race conditions |
-| 5 | SHA-1 collision enables cache poisoning | MEDIUM | Cryptographic weakness |
-| 6 | Insufficient deserialization validation on load | MEDIUM | Deserialization |
-| 7 | Predictable temp file path | MEDIUM | Predictable temp |
-| 8 | Staged payload in world-traversable /tmp | MEDIUM | Temp file exposure |
+| # | Severity | Category | Location | Description |
+|---|----------|----------|----------|-------------|
+| 1 | MEDIUM | DoS / Resource Exhaustion | L1838,1868 | Unbounded n_kv/n_tensors calloc from GGUF header |
+| 2 | MEDIUM | DoS / CPU Hang | L20420 | `next_pow2` infinite loop via GGUF merges.len overflow |
+| 3 | MEDIUM | Symlink Attack | L21879 | `/tmp/ds4.lock` follows symlinks; arbitrary file truncation |
+| 4 | MEDIUM | Info Disclosure | L22895 | Session payload in world-writable `/tmp` |
+| 5 | LOW-MEDIUM | Integer Overflow | L20673 | `bpe_rank` length calc can overflow on 32-bit |
+| 6 | MEDIUM | Error Handling | L10849 | GPU alloc failures not checked individually |
+| 7 | LOW-MEDIUM | Div-by-Zero | L1498 | `align_up` has no zero-alignment guard |
+| 8 | MEDIUM | Process Crash DoS | L25660 | Out-of-range token ID kills server via `ds4_die` |
+
+---
+
+## Areas Reviewed Without Significant Findings
+
+### GGUF Tensor Offset Validation (GOOD)
+Lines 1904–1912 properly check for both addition overflow and bounds:
+```c
+if (t->rel_offset > UINT64_MAX - m->tensor_data_pos)
+    ds4_die("tensor offset overflow");
+t->abs_offset = m->tensor_data_pos + t->rel_offset;
+if (t->bytes != 0 &&
+    (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset))
+    ds4_die("tensor points outside GGUF file");
+```
+
+### Tensor Element Count Overflow (GOOD)
+Line 1883 checks for multiplication overflow before computing element count:
+```c
+if (t->dim[d] != 0 && t->elements > UINT64_MAX / t->dim[d])
+    ds4_die("tensor element count overflow");
+```
+
+### Tensor Byte Count Overflow (GOOD)
+Line 1687 in `tensor_nbytes` checks for overflow:
+```c
+if (blocks > UINT64_MAX / info->block_bytes) return false;
+```
+
+### GGUF Metadata Array Nesting (GOOD)
+Line 1633 limits recursion depth to prevent stack overflow:
+```c
+if (depth > 8) { cursor_error(c, "metadata array nesting is too deep"); return false; }
+```
+
+### Cursor Bounds Checking (GOOD)
+The `cursor_has` function (line 1459) correctly prevents integer overflow in
+the bounds check by restructuring the comparison:
+```c
+if (n > c->size || c->pos > c->size - n) // avoids pos+n overflow
+```
+
+### Session Payload Validation (GOOD)
+`ds4_session_load_payload` validates magic, version, layout parameters, and
+remaining byte count.  Compressed/raw row counts are bounds-checked against
+capacity before being used to size reads.
+
+### Tokenizer BPE (GOOD)
+The BPE implementation uses dynamic arrays with `xrealloc` (which aborts on
+OOM) and operates on heap-allocated `owned_str` values, avoiding stack buffer
+overflows.
+
+### Mmap Region Size (GOOD)
+The mmap uses `fstat` to determine file size and maps exactly that many bytes.
+The cursor abstraction prevents reads beyond the mapped region.
+
+---
+
+## Threat Model Notes
+
+The primary untrusted-input surface is **GGUF model files**.  Users commonly
+download GGUF files from model-sharing platforms (Hugging Face, etc.), and a
+malicious model file is the most realistic attack vector.  Findings 1, 2, 5,
+and 7 are in this attack surface.
+
+The secondary surface is **API requests** to the ds4 HTTP server, where
+crafted token IDs or prompts can trigger crashes (Finding 8).
+
+The tertiary surface is **local system access** for the lock file and temp
+file issues (Findings 3 and 4).
