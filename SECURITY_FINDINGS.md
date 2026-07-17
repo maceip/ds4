@@ -1,160 +1,76 @@
-# Security Findings Report
+# Security Findings — ds4_server.c
 
-Generated: 2026-07-17
-
-This report covers NEW vulnerabilities found in the ds4 codebase, excluding
-issues already identified in prior scans (agent shell execution, path sandbox,
-DSML close-tag injection, search ReDoS, prompt injection persistence, trace
-permissions, session forgery, terminal escape injection, Chrome CDP flags,
-linenoise UTF-8 OOB, CLI/eval terminal escape injection).
-
----
-
-## Finding 1
+## Finding 1: NaN / Infinity Injection via strtod in JSON Number Parser
 
 ```json
 {
   "severity": "high",
-  "location": "rax.c",
-  "title": "raxAddChildNoAlloc: use-after-realloc on OOM after node resize",
-  "description": "In raxAddChildNoAlloc(), after a successful rax_realloc() of the parent node at line 320 (which may move the allocation to a new address and free the old one), a subsequent OOM failure from raxNewValueNode() at line 363 causes the function to return NULL. The caller (raxAddChild at line 470, or raxGenericInsert at line 1039) still holds the original pre-realloc pointer, which now points to freed memory. The oom handler in raxGenericInsert (line 1075) then dereferences this stale pointer (h->size), causing a use-after-free.",
-  "impact": "Memory corruption leading to potential code execution. In a server context (ds4_server.c uses rax for tool_memory), an attacker who can trigger memory pressure during tree insertion (e.g., by filling tool memory with many entries) could exploit this for arbitrary write via heap corruption.",
-  "attack_path": "1. Attacker sends many tool memory entries to ds4_server, growing a rax tree to have 13+ children on a node. 2. A new insertion triggers raxAddChildNoAlloc which needs to materialize child 12 (inline->real). 3. Memory pressure causes raxNewValueNode to fail. 4. rax_realloc already moved the node, so the caller holds a dangling pointer. 5. The oom handler at line 1075 writes to freed memory via h->isnull=1, h->iskey=1. 6. Heap metadata corruption enables further exploitation.",
-  "evidence": ["rax.c:320", "rax.c:321", "rax.c:362", "rax.c:363", "rax.c:1039", "rax.c:1075-1079"],
-  "remediation": "raxAddChildNoAlloc must allocate materialized_child BEFORE performing rax_realloc, or track the new node pointer via an output parameter even on failure. Alternatively, pass back the reallocated node through parentlink or an extra out-parameter so the caller can update its pointer regardless of success."
+  "location": "ds4_server.c",
+  "title": "json_number() accepts NaN, Infinity, and hex floats via strtod, enabling undefined behavior and model parameter corruption",
+  "description": "The json_number() function (line 258) delegates directly to strtod() without validating that the input is a valid JSON number. C strtod() accepts 'NaN', 'Infinity', '-Infinity', and hex floats ('0x1p10') which are not valid JSON per RFC 8259. These non-finite values propagate into model sampling parameters (temperature, top_p, min_p) and through json_int() into top_k. In json_int() (line 268), NaN bypasses both clamping checks (NaN < 0 is false; NaN > INT_MAX is false) and produces undefined behavior when cast to int: (int)NaN = INT_MIN (-2147483648) on x86-64. For float parameters, NaN temperature is passed directly to ds4_session_sample() (line 10324) causing NaN propagation through softmax, producing garbage probability distributions. Infinity temperature makes all logits zero, causing uniform random token sampling.",
+  "impact": "An attacker can corrupt the model's sampling behavior by sending a single malformed request. NaN temperature causes undefined behavior in the inference engine's softmax computation (NaN propagation through exp/sum). INT_MIN top_k from (int)NaN is passed to the engine as a nonsensical negative top-k, potentially causing out-of-bounds access or assertion failures. Infinity temperature forces uniform random sampling, making the model produce gibberish. On models serving production traffic, this degrades or crashes inference for all queued requests.",
+  "attack_path": "1. Send POST /v1/chat/completions with body: {\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"temperature\":NaN}\n2. json_number() at line 261 calls strtod(\"NaN\", &end); strtod returns NaN, end advances past 'NaN'\n3. json_number returns true with *out = NaN\n4. parse_chat_request stores r->temperature = (float)NaN at line 2693\n5. generate_job passes NaN to ds4_session_sample() at line 10324\n6. Softmax computation produces NaN probabilities → crash or garbage output\n\nAlternative: {\"top_k\": NaN} → json_int casts (int)NaN → INT_MIN → passed as top_k",
+  "evidence": ["ds4_server.c:258-265 (json_number uses strtod without JSON validation)", "ds4_server.c:268-274 (json_int: NaN bypasses both clamps, (int)NaN is UB)", "ds4_server.c:2687-2693 (temperature = (float)v where v can be NaN)", "ds4_server.c:2694-2707 (top_p, min_p, top_k also vulnerable)", "ds4_server.c:10311-10324 (NaN temperature reaches ds4_session_sample)"],
+  "remediation": "Validate json_number() output: reject if !isfinite(v). Add an explicit check after strtod: if the first character is not '-' or a digit, return false. Alternatively, pre-validate that the input matches the JSON number grammar (optional minus, digit sequence, optional fraction, optional exponent) before calling strtod."
 }
 ```
 
-## Finding 2
+## Finding 2: Null Byte Injection via \\u0000 Causes Prompt Truncation and Response Corruption
 
 ```json
 {
   "severity": "high",
-  "location": "rax.c",
-  "title": "raxFindParentLink / raxRemoveChild: unbounded out-of-bounds read on child mismatch",
-  "description": "raxFindParentLink (line 1124) and raxRemoveChild (line 1211) both scan the parent node's child pointer array in an unbounded while(1) loop with no size check. The code assumes the child pointer will always be found. If tree state becomes inconsistent (e.g., after a partial OOM modification from Finding 1, or due to concurrent access without locking in ds4_server tool_memory), the scan reads past the node allocation without limit.",
-  "impact": "Out-of-bounds heap read that continues until a coincidental pointer match or segfault. In the OOB read path, sensitive heap data (keys, values, function pointers) may be compared against the searched child pointer, leaking information through timing or side channels. A segfault causes denial of service in the server process.",
-  "attack_path": "1. Trigger Finding 1 to corrupt tree state. 2. A subsequent raxRemove operation calls raxRemoveCleanup (line 1245), which calls raxRemoveChild with a child pointer freed at line 1235. 3. If the allocator has reused the freed child's address, raxRemoveChild scans past the node boundary. 4. The OOB read causes crash or heap information disclosure. 5. If the scan matches a wrong pointer, raxRemoveChildAtPtr (line 1141) performs memmove operations on corrupt data, enabling heap corruption.",
-  "evidence": ["rax.c:1119-1133", "rax.c:1211-1220", "rax.c:1235", "rax.c:1245"],
-  "remediation": "Add bounds checking to both raxFindParentLink and raxRemoveChild: iterate only up to n->iscompr ? 1 : n->size child pointers, and return NULL (or assert) if the child is not found. All callers must handle the failure."
+  "location": "ds4_server.c",
+  "title": "json_string() decodes \\u0000 as embedded null byte, causing silent truncation throughout the request lifecycle",
+  "description": "json_string() (line 214) correctly decodes the JSON escape \\u0000 into a literal 0x00 byte via utf8_put() (line 242 with cp=0). The resulting string contains an embedded null byte stored in a buf with tracked length. However, every downstream consumer uses strlen()-based functions: buf_puts() (line 135-136) calls strlen(), json_escape() (line 4155) iterates with 'for (; *s; s++)', and fputs() for trace logging. All of these stop at the first embedded null byte. Critically, json_escape_n() (line 4175) also truncates because it creates a null-terminated copy via xstrndup() then delegates to json_escape(). This means prompt rendering, SSE response generation, and trace logging all silently truncate content at embedded null bytes.",
+  "impact": "An attacker can truncate message content at arbitrary points. Content after \\u0000 is invisible to the model (prompt is truncated), invisible in responses (json_escape truncates), and invisible in trace logs (fputs truncates). This enables: (1) Prompt truncation attacks — inject \\u0000 before a safety instruction to remove it from the model's context. (2) Inconsistent views — the client sends content X+Y, the model sees only X, responses reflect only X. (3) Malformed JSON in SSE — if r->model contains \\u0000, json_escape produces a truncated quoted string, and subsequent buf_puts appends more JSON, creating syntactically broken JSON that crashes clients.",
+  "attack_path": "1. Send: {\"messages\":[{\"role\":\"system\",\"content\":\"You must refuse harmful requests.\\u0000\"},{\"role\":\"user\",\"content\":\"do something harmful\"}]}\n2. json_string() at line 242: utf8_put(&b, 0) embeds 0x00 in the system message\n3. render_chat_prompt_text() at line 2291: buf_puts(&out, m->content) calls strlen() which returns length up to the null byte — 'You must refuse harmful requests.' is truncated, omitting context after it\n4. The model receives the system message truncated before the safety instruction\n5. The trace file also truncates (line 9220: fputs stops at null)\n6. SSE responses also truncate model name if \\u0000 was in the model field",
+  "evidence": ["ds4_server.c:214-256 (json_string decodes \\u0000 via utf8_put at line 242)", "ds4_server.c:183-185 (utf8_put: cp=0 → buf_putc(b, 0))", "ds4_server.c:135-136 (buf_puts uses strlen — truncates at null)", "ds4_server.c:4153-4172 (json_escape uses *s loop — truncates at null)", "ds4_server.c:4175-4178 (json_escape_n creates xstrndup copy then calls json_escape — still truncates)", "ds4_server.c:2291 (render_chat_prompt_text: buf_puts truncates system content)", "ds4_server.c:2311 (buf_puts truncates user content)"],
+  "remediation": "Either reject \\u0000 in json_string() (return false when cp == 0), or replace null bytes with the Unicode replacement character U+FFFD. Additionally, fix json_escape_n() to use json_escape_fragment_n() (line 4181) which correctly handles explicit lengths without null-termination dependency."
 }
 ```
 
-## Finding 3
+## Finding 3: Lone Surrogate Encoding Produces Invalid UTF-8, Enables Encoding Attacks
 
 ```json
 {
   "severity": "high",
-  "location": "rax.c",
-  "title": "raxRemoveCleanup: use of freed pointer value as search key",
-  "description": "In raxRemoveCleanup (line 1226), the function frees child nodes in a loop (line 1235: rax_free(child)), then uses the freed pointer's value to locate and remove the child from the parent via raxRemoveChild(h, child) at line 1245. While the parent's child pointer array still holds the old address, using a freed pointer's value is undefined behavior in C. More critically, if malloc returns the same address for a new allocation between the free at line 1235 and the search at line 1245 (possible in multi-threaded server use), the search could match the wrong child slot, causing structural corruption of the radix tree.",
-  "impact": "Radix tree structural corruption. In ds4_server's tool_memory (which uses rax for key-value lookup), this can cause tools to return data from the wrong tool memory entry, or crash the server. The corruption could propagate to affect request routing.",
-  "attack_path": "1. Create tool memory entries to build a multi-level rax tree. 2. Delete entries to trigger raxRemoveCleanup with multi-level cleanup. 3. In the server's multi-threaded context, another thread's malloc reuses the freed child address. 4. raxRemoveChild matches the wrong slot, corrupting the parent node's child array. 5. Subsequent lookups return wrong data or crash.",
-  "evidence": ["rax.c:1231-1245", "rax.c:1211-1219"],
-  "remediation": "Save the child pointer from the parent BEFORE freeing the child node, or restructure the cleanup to call raxRemoveChild before rax_free."
+  "location": "ds4_server.c",
+  "title": "json_string() encodes unpaired UTF-16 surrogates as CESU-8, producing ill-formed UTF-8 that propagates to model and client responses",
+  "description": "In json_string() (line 239), when a high surrogate (U+D800–U+DBFF) is encountered via \\uD800-\\uDBFF, the parser attempts to read a following \\uXXXX for the low surrogate. If no \\u follows, or json_u16() fails, the high surrogate code point is passed directly to utf8_put() (line 242). utf8_put() encodes any codepoint 0x800-0xFFFF as 3-byte UTF-8, producing bytes 0xED 0xA0 0x80 through 0xED 0xBF 0xBF for surrogates. These byte sequences are explicitly forbidden by RFC 3629 (UTF-8 definition). A second bug exists: if json_u16() succeeds but the decoded value is NOT a low surrogate (0xDC00-0xDFFF), the && short-circuit means the entire condition is false, but json_u16 has already consumed 6 bytes of input (\\uXXXX). The decoded codepoint from those 6 bytes is silently discarded — a data loss bug. The high surrogate is still encoded as invalid UTF-8.",
+  "impact": "Invalid UTF-8 sequences from lone surrogates propagate through the entire pipeline: (1) They are stored in message content and passed to the model tokenizer, which may crash, produce unexpected tokens, or misalign the KV cache. (2) json_escape() (line 4153) does not filter or escape bytes >= 0x20, so the invalid sequences pass through to JSON responses and SSE events. This produces invalid JSON per RFC 8259, which mandates that strings contain valid Unicode. (3) Client JSON parsers (Python json, JavaScript JSON.parse, Go encoding/json) may reject, silently replace, or misinterpret these sequences, leading to deserialization failures or encoding confusion attacks. (4) The codepoint loss variant silently drops characters from user input, causing data corruption.",
+  "attack_path": "1. Send: {\"messages\":[{\"role\":\"user\",\"content\":\"test\\uD800inject\"}]}\n2. json_string() at line 238: json_u16 decodes \\uD800, cp = 0xD800\n3. Line 239: cp >= 0xD800 is true, cp <= 0xDBFF is true (it's a high surrogate)\n4. Line 239: json_u16(p, &lo) — next chars are 'inject', not '\\u', so json_u16 returns false\n5. Short-circuit: condition is false, cp remains 0xD800\n6. Line 242: utf8_put(&b, 0xD800) encodes as 0xED 0xA0 0x80 (CESU-8)\n7. Content with invalid UTF-8 reaches model and all JSON/SSE output\n\nData loss variant:\n1. Send: \"\\uD800\\u0041\" (high surrogate followed by U+0041 'A')\n2. json_u16 succeeds for \\u0041 (lo = 0x41), but 0x41 < 0xDC00, so condition is false\n3. The 'A' codepoint (0x41) is lost — input consumed but value discarded\n4. High surrogate 0xD800 encoded as invalid UTF-8, 'A' silently dropped",
+  "evidence": ["ds4_server.c:239-242 (lone surrogate reaches utf8_put without rejection)", "ds4_server.c:183-198 (utf8_put encodes any codepoint including surrogates as UTF-8)", "ds4_server.c:201-211 (json_u16 consumes 6 chars on success, creating silent data loss)", "ds4_server.c:4153-4172 (json_escape passes through invalid UTF-8 bytes >= 0x20)"],
+  "remediation": "After the surrogate pair check at line 239-241, add: if (cp >= 0xD800 && cp <= 0xDFFF) { either goto fail (strict: reject lone surrogates) or cp = 0xFFFD (lenient: replace with U+FFFD replacement character). } For the data loss variant, save the parser position before calling json_u16 for the low surrogate and restore it if the value is not a valid low surrogate."
 }
 ```
 
-## Finding 4
-
-```json
-{
-  "severity": "high",
-  "location": "ds4_web.c",
-  "title": "WebSocket frame reassembly: no total message size limit enables OOM denial of service",
-  "description": "web_ws_read_message (line 556) reassembles multi-frame WebSocket messages in a loop. Each individual frame's payload is checked against DS4_WEB_MAX_RESULT_BYTES * 4 (4 MB) at line 581. However, there is no limit on the total accumulated message size across continuation frames (opcode 0x0). An attacker who controls or MITMs the WebSocket connection to Chrome's CDP port can send arbitrarily many continuation frames of ~4 MB each, growing the web_buf without bound. web_buf_append calls realloc which will eventually fail, and web_xmalloc (line 66) calls exit(1) on allocation failure, crashing the entire agent process.",
-  "impact": "Denial of service via process crash. The agent process exits immediately on OOM because web_xmalloc calls exit(1). Since the agent is a single process managing model inference, a crash kills the entire session including unsaved state.",
-  "attack_path": "1. Agent's visit_page tool connects to a malicious or compromised website. 2. If the page redirects to a rogue WebSocket or the attacker intercepts CDP traffic on localhost (CDP binds to 127.0.0.1 with --remote-allow-origins=*). 3. The rogue server sends thousands of continuation frames (opcode 0x0, fin=0) each near the 4MB single-frame limit. 4. web_buf_append keeps growing via realloc. 5. Eventually realloc returns NULL, web_xmalloc calls exit(1). 6. The agent process dies.",
-  "evidence": ["ds4_web.c:556-610", "ds4_web.c:581", "ds4_web.c:604", "ds4_web.c:66-71"],
-  "remediation": "Add a total accumulated message size check in the web_ws_read_message loop. Reject messages exceeding DS4_WEB_MAX_RESULT_BYTES total. Also replace exit(1) in web_xmalloc with a graceful error return path."
-}
-```
-
-## Finding 5
-
-```json
-{
-  "severity": "high",
-  "location": "ds4_web.c",
-  "title": "CDP WebSocket ID matching via naive string search allows response spoofing",
-  "description": "web_json_id_matches (line 617) uses strstr(json, '\"id\"') to locate the id field, then atoi on the value after the colon. This naive JSON parsing matches ANY occurrence of '\"id\"' in the response, including inside string values. A crafted CDP response (from a compromised Chrome extension or malicious page injecting CDP events) could include '\"id\":TARGET_ID' inside a string field of an event message, causing the agent to accept an attacker-controlled response as the legitimate CDP call result. Since CDP call results drive page navigation, JavaScript evaluation, and screenshot capture, this enables the attacker to inject arbitrary content into the agent's tool results.",
-  "impact": "An attacker can inject fake CDP responses that the agent treats as legitimate. This allows returning attacker-controlled text as visit_page content, or manipulating the agent's view of page state. Since tool results are fed directly into the LLM context, this enables prompt injection through web content.",
-  "attack_path": "1. Agent browses a page that triggers Chrome to emit a CDP event containing a string like '\"id\":42' (where 42 is the pending request ID). 2. web_cdp_call receives this event message first. 3. web_json_id_matches finds the '\"id\":42' pattern inside the event string and returns true. 4. The agent treats the event as the CDP response, getting attacker-controlled content. 5. The real response is then discarded or matches a future request ID.",
-  "evidence": ["ds4_web.c:617-625", "ds4_web.c:649-655"],
-  "remediation": "Implement proper JSON parsing for response ID matching. At minimum, verify that the '\"id\"' key is at the top level of the JSON object (preceded by '{' or ',' after accounting for whitespace) rather than nested inside a string value."
-}
-```
-
-## Finding 6
+## Finding 4: json_number() via strtod Accepts Hex Floats Enabling Validation Bypass
 
 ```json
 {
   "severity": "medium",
-  "location": "ds4_agent.c",
-  "title": "Bash tool output temp file race: predictable path and insufficient cleanup",
-  "description": "agent_bash_start (line 6718) creates temporary output files using mkstemp with the template '/tmp/ds4_agent_output_XXXXXX'. While mkstemp itself is safe, the generated file path is stored in job->path and the file persists until the job is freed. The file is created with default umask permissions (typically 0600, but depends on process umask). More critically, there is no cleanup of temp files if the agent process crashes (e.g., from Finding 4's exit(1)). These files contain the full stdout/stderr of shell commands, which may include secrets, API keys, database credentials, or other sensitive data from the user's tool execution.",
-  "impact": "Sensitive command output persists in world-readable temp files after agent crash. An attacker with local access can read /tmp/ds4_agent_output_* files to extract secrets from prior agent sessions.",
-  "attack_path": "1. Agent executes bash tool commands that output credentials (e.g., env vars, config files). 2. Output is captured to /tmp/ds4_agent_output_XXXXXX. 3. Agent crashes due to any bug (OOM, signal, etc.). 4. Temp files remain on disk. 5. Local attacker reads the files to extract credentials.",
-  "evidence": ["ds4_agent.c:6718", "ds4_agent.c:6764", "ds4_agent.c:6604-6613"],
-  "remediation": "Set restrictive permissions (0600) explicitly after mkstemp. Implement an atexit handler or signal handler to clean up temp files on abnormal exit. Consider using tmpfile() or O_TMPFILE to create files that are automatically cleaned up."
+  "location": "ds4_server.c",
+  "title": "strtod in json_number() accepts C99 hex float literals (0x1p10), allowing non-JSON values to bypass input validation",
+  "description": "Beyond NaN/Infinity, strtod() also accepts C99 hexadecimal floating-point literals like '0x1p10' (=1024.0), '0x1.8p1' (=3.0), etc. These are not valid JSON numbers. An attacker can craft numeric values in hex float notation that parse to specific double values. While the resulting finite values are less dangerous than NaN/Infinity, this violates the principle that the server should only accept valid JSON. Client-side validation that checks for decimal digits would not catch hex floats, creating a validation bypass.",
+  "impact": "Hex float literals bypass client-side input validation that assumes JSON-compliant decimal numbers. This could be used to inject specific numeric values through validation layers that check for reasonable ranges using regex patterns matching decimal numbers only. For example, '0x1.0p30' = 1073741824.0 as max_tokens (via json_int) would set max_tokens = INT_MAX after clamping, forcing the model to generate until context exhaustion — a resource exhaustion vector if the default max_tokens is intended to be small.",
+  "attack_path": "1. Client-side validation checks temperature with regex /^[0-9]+(\\.[0-9]+)?$/ — allows only decimal\n2. Attacker sends: {\"temperature\": 0x1.0p30, \"max_tokens\": 0x1p31}\n3. json_number() calls strtod('0x1.0p30') → 1073741824.0\n4. temperature = (float)1073741824.0 — extremely high temperature randomizes output\n5. json_int for max_tokens: strtod('0x1p31') → 2147483648.0 > INT_MAX → clamped to INT_MAX\n6. Model generates up to 2B tokens, exhausting compute resources",
+  "evidence": ["ds4_server.c:258-265 (json_number delegates to strtod without format validation)", "ds4_server.c:268-274 (json_int clamps but accepts any strtod output)"],
+  "remediation": "Validate that the first non-whitespace character of the number is '-' or '0'-'9' before calling strtod. Alternatively, implement a JSON-compliant number parser that only accepts the grammar: [ '-' ] ( '0' | '1'-'9' digits ) [ '.' digits ] [ ('e'|'E') ['+'/'-'] digits ]."
 }
 ```
 
-## Finding 7
+## Finding 5: json_escape_n() Silently Truncates at Embedded Null Bytes in SSE Stream Output
 
 ```json
 {
   "severity": "medium",
-  "location": "ds4_agent.c",
-  "title": "Race condition between worker thread tool execution and main thread session switch",
-  "description": "The agent worker thread executes tool calls (agent_execute_tool_calls at line 7791) without holding the mutex, while the main thread can process /switch commands (line 5367-5412) that completely replace the session state. The /switch command checks w->status.state != AGENT_WORKER_IDLE to gate on 'model is busy', but this check and the subsequent session state replacement are not atomic with respect to the worker thread's state transitions. Specifically, the worker can be between tool_result generation (line 7791) and session transcript append (line 7834), at which point status may transiently appear idle during a tool that yields (e.g., bash with wait), allowing the main thread to switch sessions. The worker then appends tool_result to the wrong session's transcript.",
-  "impact": "Transcript corruption where tool results from one session are appended to a different session. This can cause the LLM to hallucinate based on wrong context, or leak sensitive tool output (file contents, command output) from one session into another.",
-  "attack_path": "1. User starts a long-running bash tool (e.g., sleep 5 && cat /etc/shadow). 2. While the bash job is waiting, the agent status shows AGENT_WORKER_GENERATING but the tool is between poll cycles. 3. User rapidly sends /switch to change to a different session. 4. The race window allows the switch to complete. 5. When the bash job finishes, its output is appended to the new session's transcript. 6. The new session now contains the cat /etc/shadow output.",
-  "evidence": ["ds4_agent.c:7791", "ds4_agent.c:7834", "ds4_agent.c:5367", "ds4_agent.c:5401-5411"],
-  "remediation": "Hold the mutex during the critical section that spans tool execution through transcript append. Alternatively, use a generation counter to detect stale tool results after session switch."
-}
-```
-
-## Finding 8
-
-```json
-{
-  "severity": "medium",
-  "location": "ds4_web.c",
-  "title": "web_random_bytes: weak PRNG fallback for WebSocket masking key",
-  "description": "web_random_bytes (line 320) falls back to a trivially predictable LCG seeded with time(NULL) ^ (getpid() << 32) when /dev/urandom cannot be opened. This generates the WebSocket Sec-WebSocket-Key for the CDP handshake (used indirectly through web_base64 at line 340). While the WebSocket key is primarily used for upgrade validation, if the fallback is used, the masking keys for client-to-server frames (generated via the same or similar mechanism at line 528) become predictable, allowing a network observer to unmask WebSocket traffic containing CDP commands with sensitive page content.",
-  "impact": "If /dev/urandom is unavailable (container/chroot environments), CDP WebSocket traffic is protected only by a trivially predictable PRNG. A network observer on localhost can unmask frames to read CDP commands containing page text, JavaScript evaluation results, and potentially captured credentials.",
-  "attack_path": "1. Agent runs in a restricted container where /dev/urandom is not mounted. 2. web_random_bytes falls back to LCG seeded with time^pid. 3. Attacker on same host observes the WebSocket connection to localhost:9333. 4. Attacker predicts the PRNG state from known time and pid. 5. Attacker unmasks all client-to-server frames. 6. CDP commands including Runtime.evaluate results (which may contain page credentials or sensitive content) are exposed.",
-  "evidence": ["ds4_web.c:320-337", "ds4_web.c:510-541"],
-  "remediation": "Try additional entropy sources (getrandom() syscall, /dev/random) before falling back to the LCG. If no good entropy source is available, abort the WebSocket connection rather than proceeding with predictable keys."
-}
-```
-
-## Finding 9
-
-```json
-{
-  "severity": "medium",
-  "location": "rax.c",
-  "title": "raxAddChildNoAlloc: materialized_child memory leak on subsequent memmove failure",
-  "description": "In raxAddChildNoAlloc, if raxNewValueNode succeeds at line 362 (allocating materialized_child), but the function encounters an error in any subsequent step before reaching line 447 where materialized_child is stored, the allocated node is leaked. While the current code has no explicit error checks after line 363 before 447, the memmove operations at lines 376-428 operate on the reallocated buffer which is guaranteed valid. However, if a caller wraps this in a context where failure between these points is possible (or if the code is modified), the leak becomes active. More concretely, the leak occurs because raxAddChild (line 465) which wraps raxAddChildNoAlloc frees the newly allocated child on failure but does NOT know about materialized_child to free it.",
-  "impact": "Memory leak of raxNode allocations. In long-running server processes, repeated OOM-triggered insertions and retries can accumulate leaked nodes, gradually consuming available memory.",
-  "evidence": ["rax.c:357-363", "rax.c:447-451", "rax.c:465-477"],
-  "remediation": "Track materialized_child as part of the function's cleanup path. If the function returns NULL for any reason after allocating materialized_child, free it."
-}
-```
-
-## Finding 10
-
-```json
-{
-  "severity": "medium",
-  "location": "ds4_agent.c",
-  "title": "agent_bash_start: command injection via unvalidated shell metacharacters in temp file path",
-  "description": "agent_bash_start stores the mkstemp-generated temp path in job->path (line 6764). While mkstemp generates safe characters, the path prefix '/tmp/ds4_agent_output_' is hardcoded and safe. However, agent_bash_read_head (line 6787) opens this path with fopen, and if the file is replaced via a symlink between mkstemp and later reads (the file descriptor tmpfd is not used for reading, fopen reopens by path), an attacker could redirect reads to an arbitrary file. The agent then feeds this file's content into the model's context as 'bash output', allowing data exfiltration from arbitrary files the agent process can read.",
-  "impact": "Local privilege escalation via symlink attack. An attacker with write access to /tmp can replace the temp file between creation and subsequent read, injecting arbitrary file content into the agent's tool output. This can leak sensitive system files.",
-  "attack_path": "1. Attacker monitors /tmp for ds4_agent_output_* files. 2. Agent starts a bash command, creating /tmp/ds4_agent_output_XXXXXX. 3. Attacker replaces the file with a symlink to /etc/shadow (or SSH keys, etc.). 4. Agent reads the temp file to get bash output (via fopen at line 6793). 5. fopen follows the symlink, reading /etc/shadow. 6. Contents are displayed as bash output and fed into the LLM context.",
-  "evidence": ["ds4_agent.c:6718-6719", "ds4_agent.c:6764", "ds4_agent.c:6787-6813"],
-  "remediation": "Use the already-open file descriptor (job->tmp_fd) for reading instead of reopening by path. Use fdopen or lseek+read on the fd. Alternatively, open with O_NOFOLLOW to prevent symlink following."
+  "location": "ds4_server.c",
+  "title": "json_escape_n() truncates output at embedded null bytes despite accepting an explicit length parameter, causing malformed SSE events",
+  "description": "json_escape_n() (line 4175) is intended to JSON-escape exactly n bytes of input. However, its implementation creates a null-terminated copy via xstrndup() then delegates to json_escape() which iterates with 'for (; *s; s++)'. If the input contains an embedded null byte at position k < n, only the first k bytes are escaped. This function is distinct from json_escape_fragment_n() (line 4181) which correctly uses an explicit length loop. json_escape_n is used in all SSE delta emission functions: sse_chat_delta_n (line 5133), responses_sse_reasoning_delta (line 6122), and responses_sse_output_text_delta (line 6226). If the model produces output containing a null byte (via a special token or corrupted state), the SSE event would contain truncated JSON, breaking the event stream.",
+  "impact": "SSE events carry JSON payloads where the delta text is escaped via json_escape_n. Truncation produces JSON like {\"delta\":\"partial (missing closing quote and braces), which is syntactically invalid. Clients parsing the SSE stream would encounter a parse error and likely drop the connection, losing the entire response. Combined with Finding 2 (null byte injection via \\u0000), an attacker can craft inputs whose null bytes survive into the model context and influence output in ways that trigger this truncation path.",
+  "attack_path": "1. If model output somehow contains a null byte (through corrupted tokenizer state or Finding 2's null byte propagation)\n2. Token streaming calls sse_chat_delta_n() at line 5133\n3. json_escape_n(&b, text, len) at line 5133 creates xstrndup copy\n4. json_escape processes the copy until the null byte — output is truncated\n5. buf_puts appends closing JSON after the truncated escape\n6. SSE event has malformed JSON: data: {\"choices\":[{\"delta\":{\"content\":\"trunc... (missing closing structures)\n7. Client SSE parser encounters parse error, drops connection",
+  "evidence": ["ds4_server.c:4175-4178 (json_escape_n creates null-terminated copy, delegates to json_escape)", "ds4_server.c:4181-4198 (json_escape_fragment_n correctly uses explicit length — the safe alternative exists but is not used)", "ds4_server.c:5133 (sse_chat_delta_n uses json_escape_n)", "ds4_server.c:6122 (responses_sse_reasoning_delta uses json_escape_n)", "ds4_server.c:6226 (responses_sse_output_text_delta uses json_escape_n)"],
+  "remediation": "Replace the json_escape_n() implementation to use an explicit-length loop instead of delegating to json_escape(). The simplest fix: wrap the existing json_escape_fragment_n() with quotes: buf_putc(b, '\"'); json_escape_fragment_n(b, s, n); buf_putc(b, '\"');. This matches what json_escape does but respects the explicit length."
 }
 ```
