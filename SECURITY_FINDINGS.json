@@ -1,0 +1,112 @@
+[
+  {
+    "severity": "high",
+    "location": "ds4.c",
+    "title": "Session payload deserialization: token IDs not validated against vocabulary bounds",
+    "description": "In ds4_session_load_payload(), token IDs read from the session payload file are stored without any validation against the model's vocabulary size. The function reads saved_tokens uint32_t values via payload_read_u32() and pushes them via token_vec_push(&new_checkpoint, (int)tok) with no range check (e.g. tok >= DS4_N_VOCAB). When these out-of-range token IDs are later used as array indices into vocab->token[] (in ds4_token_text) or logit arrays (in sample_argmax), this causes out-of-bounds memory reads. The same issue exists in the GPU path at line 23345-23351.",
+    "impact": "A maliciously crafted session payload file can inject arbitrary token IDs that cause out-of-bounds array access when the session checkpoint is subsequently used for inference or token decoding, leading to information disclosure or a crash.",
+    "attack_path": "1. Attacker crafts a KV cache file with valid header fields (magic, version, layer counts) but token ID values exceeding DS4_N_VOCAB. 2. The file is placed in the server's --kv-disk-dir. 3. When the server loads this checkpoint via kv_cache_try_load -> ds4_kvstore_try_load_text -> ds4_session_load_payload, the invalid token IDs are accepted. 4. Subsequent calls to ds4_token_text(e, token) index vocab->token[token] out-of-bounds, reading arbitrary heap data. 5. Subsequent ds4_session_sample() or ds4_session_argmax() operates on logits[] at the restored position, and the checkpoint tokens influence graph state.",
+    "evidence": ["ds4.c:23203-23209", "ds4.c:23345-23351", "ds4.c:21227-21236"],
+    "remediation": "Add a vocabulary range check when reading token IDs from session payloads: reject or clamp tokens where (int)tok < 0 || (int)tok >= DS4_N_VOCAB."
+  },
+  {
+    "severity": "high",
+    "location": "ds4.c",
+    "title": "GGUF parsing: token string length causes integer overflow in byte_encode allocation",
+    "description": "The byte_encode() function at line 20640 allocates (size_t)in.len * 4 + 1 bytes. The in.len value comes from a GGUF token string whose length is bounded only by the file size (via cursor_has), which can be up to SIZE_MAX. When in.len exceeds SIZE_MAX/4 (approximately 1 GiB on 32-bit or 4 EiB on 64-bit), the multiplication wraps around, causing a small heap allocation followed by a write loop that fills the buffer far beyond its actual size. While cursor_has bounds len to fit within the mapped file, on 32-bit platforms or with very large GGUF files, in.len * 4 can wrap.",
+    "impact": "On 32-bit platforms, a crafted GGUF file with a token string longer than ~1 GiB triggers a heap buffer overflow in byte_encode, potentially allowing arbitrary code execution. On 64-bit platforms with very large files, the allocation may exhaust memory.",
+    "attack_path": "1. Attacker crafts a GGUF with a token string whose length field is set to a value > SIZE_MAX/4. 2. cursor_has validates the length fits in the file mapping (possible with a sparse/large file). 3. vocab_load loads the token and calls bpe_tokenize_text -> bpe_emit_piece -> byte_encode. 4. byte_encode allocates in.len * 4 + 1 which overflows to a small value. 5. The encoding loop writes up to in.len * 4 bytes into the undersized buffer, causing heap corruption.",
+    "evidence": ["ds4.c:20639-20648", "ds4.c:1488-1494"],
+    "remediation": "Add an overflow check before the allocation in byte_encode: if (in.len > (SIZE_MAX - 1) / 4) return NULL or die."
+  },
+  {
+    "severity": "high",
+    "location": "ds4.c",
+    "title": "Hash table probe infinite loop from malicious GGUF token/merge data",
+    "description": "The table_put() function at line 20437 uses open addressing with linear probing. It probes slots until it finds an unused one, but there is no check for table fullness. The table_init() function at line 20427 sizes the table as next_pow2(expected * 2 + 16), which can overflow. More critically, if a malicious GGUF provides a token table and merge table with carefully chosen strings that hash-collide, or if next_pow2(expected * 2 + 16) overflows to 0 (causing cap=0, mask=UINT64_MAX), the while loop in table_put will spin indefinitely, or if t->used approaches t->cap (100% load factor), every insert degrades to O(n) probing and the table_put loop will hang. The load factor is ~50% for normal data, but a GGUF where tokens.len and merges.len are attacker-controlled means the table can be filled if the sizes are manipulated.",
+    "impact": "A crafted GGUF file can cause the loading process to hang indefinitely (denial of service) during tokenizer initialization by triggering hash table collisions.",
+    "attack_path": "1. Attacker provides a GGUF where tokenizer.ggml.tokens has many entries with hash-colliding names. 2. table_init allocates a hash table of expected capacity. 3. table_put is called for each token; with high collision rates, probing degrades to O(n) per insert. 4. With thousands of collisions, the tokenizer load takes seconds to hours to complete. 5. If expected * 2 + 16 overflows uint64_t (e.g., tokens.len near UINT64_MAX/2), next_pow2 loops forever or returns 0, making cap=0 and causing division by zero or infinite loops.",
+    "evidence": ["ds4.c:20420-20423", "ds4.c:20426-20429", "ds4.c:20437-20452"],
+    "remediation": "Add a capacity check in table_put to reject inserts when load factor exceeds a threshold (e.g., 90%). Add overflow protection in next_pow2 and table_init for extreme values of expected."
+  },
+  {
+    "severity": "high",
+    "location": "ds4.c",
+    "title": "GGUF mmap TOCTOU: MAP_SHARED exposes tensor data to concurrent modification",
+    "description": "When metal_mapping is true, model_open() at line 1948 uses MAP_SHARED to map the GGUF file. All subsequent tensor offset validation (lines 1900-1916) and tensor boundary checks happen once at parse time against the file size recorded from fstat. However, with MAP_SHARED, the file contents reflect the underlying storage. If the file is on a writable filesystem and another process truncates or modifies the file after validation but before the tensor data is read during inference, the process reads corrupted or zero-filled data. More critically, the kernel may deliver SIGBUS if the file is truncated below the current access offset, causing a crash.",
+    "impact": "On a shared filesystem or multi-tenant environment, a concurrent write/truncation to the model file after validation but during inference can crash the process (SIGBUS), cause corrupted inference results, or cause reads of uninitialized data from the file system.",
+    "attack_path": "1. Model file is on a filesystem writable by another process (e.g., NFS, shared volume). 2. ds4 opens the model with MAP_SHARED for Metal. 3. Tensor offsets are validated against the file size at open time. 4. During inference (potentially hours/days later), the attacker truncates or overwrites the model file. 5. Metal shader reads or CPU code reads tensor data from the mmap at now-invalid offsets, causing SIGBUS crash or reading modified data.",
+    "evidence": ["ds4.c:1947-1953", "ds4.c:2286-2289", "ds4.c:1900-1916"],
+    "remediation": "Install a SIGBUS handler to gracefully abort inference on mapping faults. Consider using MAP_PRIVATE for tensor data when Metal is not strictly required, or lock the file with flock() and hold it for the process lifetime. Document that the model file must not be modified while the process is running."
+  },
+  {
+    "severity": "high",
+    "location": "ds4.c",
+    "title": "token_vec_push integer overflow: int cap doubling wraps on large inputs",
+    "description": "The token_vec_push() function at line 20472 doubles tv->cap (an int) when the vector is full: tv->cap = tv->cap ? tv->cap * 2 : 64. Since cap is a signed int (max INT_MAX = 2^31-1), once cap reaches or exceeds 2^30, the next doubling overflows to a negative value. This negative cap is then passed to xrealloc as (size_t)tv->cap * sizeof(int), and on 64-bit platforms (size_t)negative_int sign-extends to a very large value (~16 EiB), causing xrealloc to fail or, on some allocators, succeed with unexpected behavior. The len field is also an int, so with inputs exceeding ~2^30 tokens, len++ can overflow to negative, causing memory corruption on subsequent pushes.",
+    "impact": "An extremely long input document that produces more than ~1 billion tokens (or a crafted GGUF with a huge n_vocab that forces massive token emissions during BPE fallback at line 20744-20747) can cause integer overflow in the token vector capacity, leading to a crash or heap corruption.",
+    "attack_path": "1. User provides an extremely long prompt to the server's /v1/chat/completions endpoint. 2. bpe_tokenize_text calls token_vec_push for each token. 3. After ~2^30 pushes, cap overflows from positive to negative. 4. xrealloc is called with a huge size, fails, and ds4_die aborts the process. Alternatively on some allocators the realloc returns a small buffer, and subsequent writes corrupt the heap.",
+    "evidence": ["ds4.c:20472-20478", "ds4.h:44-47"],
+    "remediation": "Change token_vec fields (len, cap) from int to size_t or uint64_t, or add an explicit overflow check before doubling cap: if (tv->cap > INT_MAX / 2) ds4_die(\"token vector too large\")."
+  },
+  {
+    "severity": "high",
+    "location": "ds4.c",
+    "title": "GGUF metadata array: attacker-controlled type field enables type confusion read",
+    "description": "In skip_value() at line 1632, when processing a GGUF_VALUE_ARRAY, the item_type field is read directly from the GGUF file (line 1650) with no validation that it is a known type. If item_type is GGUF_VALUE_ARRAY (9), this allows nested arrays up to depth 8. However, if item_type is an unknown value (e.g., 13+), scalar_value_size returns 0, skip_value recurses, and calls scalar_value_size again which returns 0, then checks type==STRING (no), then type==ARRAY (no, it's unknown), and hits the 'unknown GGUF metadata type' error path which only sets the error string but the outer loop in parse_metadata at line 1846 calls ds4_die(c->error). This correctly aborts. But the real issue is in model_get_array() at line 1790: it returns the array type and data_pos without validating the type field. Callers like validate_compress_ratio_metadata (line 3652) check for GGUF_VALUE_UINT32 or INT32, but vocab_load at line 20950 only checks tokens.type == GGUF_VALUE_STRING. If an attacker changes the array type in the GGUF to STRING but fills the data with non-string binary data, cursor_string will interpret arbitrary bytes as string length + data, leading to ds4_str pointers that alias arbitrary regions of the mmap.",
+    "impact": "A crafted GGUF can cause the tokenizer to produce ds4_str objects pointing to arbitrary offsets within the mapped file. When these strings are later used as hash keys or compared, this leaks information about model weights or other file sections through timing side channels, or causes crashes if the fake string spans outside the mapped region.",
+    "attack_path": "1. Attacker crafts a GGUF where tokenizer.ggml.tokens is an array of type=STRING but the string entries have manipulated length fields. 2. cursor_string reads each length as a uint64_t and validates it fits in the file. 3. The resulting ds4_str objects point to arbitrary tensor data regions within the mmap. 4. These strings are inserted into the token_to_id hash table and used for BPE matching. 5. During tokenization, table_get performs memcmp against these aliased regions, leaking information through timing.",
+    "evidence": ["ds4.c:1488-1495", "ds4.c:1790-1798", "ds4.c:20960-20967"],
+    "remediation": "Add validation that token strings from GGUF do not overlap with the tensor data section (i.e., their offset + length stays within the metadata portion of the file). Consider copying token strings out of the mmap to prevent aliasing."
+  },
+  {
+    "severity": "high",
+    "location": "ds4.c",
+    "title": "Session layer payload: layer_end - layer_start underflow creates zero-length allocation",
+    "description": "In ds4_session_load_layer_payload() at line 22534, n_layers is calculated as layer_end - layer_start + 1u. The ds4_layer_payload_range_valid check ensures both are within bounds, but if layer_start == layer_end + 1 (which passes some checks due to unsigned wraparound), n_layers wraps to 0. With n_layers=0, xcalloc(0, sizeof(...)) returns a valid pointer to a zero-length allocation. The subsequent loops at lines 22537-22563 skip (i < 0 comparison), but the later per-layer KV write loop at line 22578 also skips. The session's checkpoint_valid is then set to false and the function appears to succeed partially, leaving the session in an inconsistent state where cached KV data has been zeroed but checkpoint_valid remains false.",
+    "impact": "A crafted distributed layer payload with inconsistent layer_start/layer_end values can leave a session in a partially-destroyed state (KV cache zeroed, checkpoint invalidated) without returning an error, potentially causing subsequent inference to use uninitialized GPU memory or produce incorrect results silently.",
+    "attack_path": "1. Distributed worker sends a layer payload with manipulated header where layer_start and layer_end values are valid individually but create edge cases in n_layers computation. 2. The function partially processes the payload, zeroing the session state (line 22572-22573). 3. It returns success or a misleading error. 4. The coordinator continues inference with a session whose KV cache contains stale/zeroed data.",
+    "evidence": ["ds4.c:22534", "ds4.c:22572-22573", "ds4.c:22462-22468"],
+    "remediation": "Add an explicit check that layer_end >= layer_start and that n_layers > 0 before proceeding with the payload restoration."
+  },
+  {
+    "severity": "medium",
+    "location": "ds4.c",
+    "title": "GGUF tensor with unsupported type has zero bytes but keeps elements count",
+    "description": "In parse_tensors() at line 1892, when tensor_nbytes() fails (returns false) for an unsupported tensor type, the code logs a warning but continues. The tensor's bytes field remains 0 (from calloc), but elements is already computed from the dimension fields. The tensor passes the subsequent bounds check at line 1908 (t->bytes != 0 guard skips the check). Later, if any code path calls tensor_data(m, t) for this tensor, it reads from t->abs_offset which is tensor_data_pos + rel_offset. If rel_offset was set to point outside the file but bytes==0 prevented the bounds check, tensor_data returns a pointer into unmapped memory.",
+    "impact": "A crafted GGUF file with a tensor that has an unsupported type code but a valid-looking name matching an expected tensor (e.g., 'blk.0.attn_norm.weight') can bypass the tensor bounds validation. If inference code then accesses this tensor via tensor_data(), it dereferences an unvalidated pointer, causing a SIGSEGV crash or reading adjacent mapped memory.",
+    "attack_path": "1. Attacker crafts a GGUF with a tensor named 'blk.0.attn_norm.weight' but with type=255 (unsupported). 2. tensor_nbytes returns false, bytes stays 0. 3. The bounds check at line 1908 is skipped due to bytes==0. 4. model_find_tensor returns this tensor. 5. The inference path calls tensor_data(m, t) at line 2288, returning m->map + t->abs_offset where abs_offset may be out of file bounds. 6. Dequantization kernel reads from this invalid pointer.",
+    "evidence": ["ds4.c:1892-1897", "ds4.c:1908-1911", "ds4.c:2286-2289"],
+    "remediation": "When tensor_nbytes fails, either reject the entire GGUF or mark the tensor as invalid (e.g., set a flag) and ensure model_find_tensor never returns a tensor with an unsupported type. At minimum, also validate abs_offset < m->size even when bytes==0."
+  },
+  {
+    "severity": "medium",
+    "location": "ds4.c",
+    "title": "Distributed result payload: unchecked malloc allows NULL dereference on OOM",
+    "description": "In dist_recv_result_alloc() in ds4_distributed.c at line 2436, malloc(result.payload_bytes) is used instead of xmalloc. If allocation fails (returns NULL), the code correctly discards remaining bytes and returns an error. However, at line 2398, malloc(result.telemetry_bytes) is also used without xmalloc. If telemetry allocation fails, the function returns 1 after discarding the bytes, leaving *payload = NULL. But the calling code at line 2594-2605 may then proceed with a NULL payload pointer depending on how the error is handled. More critically, result.payload_bytes comes from the network peer (a distributed worker) and is not capped - a malicious worker could send payload_bytes = 4GB, causing a huge allocation attempt that may succeed and then fill with attacker-controlled data.",
+    "impact": "A malicious distributed worker can cause the coordinator to allocate arbitrarily large buffers (up to 4 GiB per result.payload_bytes which is uint32_t), potentially exhausting coordinator memory. The allocated buffer is then filled with attacker-controlled data from the network.",
+    "attack_path": "1. Malicious distributed worker joins the coordinator's cluster. 2. On receiving a work request, it responds with a RESULT frame where payload_bytes = UINT32_MAX (~4 GiB). 3. The coordinator calls malloc(result.payload_bytes) at line 2436, attempting a ~4 GiB allocation. 4. If it succeeds, dist_read_full fills it with attacker-controlled data. 5. This payload is then passed to the caller which may interpret it as hidden_hc float values, corrupting inference state.",
+    "evidence": ["ds4_distributed.c:2434-2448", "ds4_distributed.c:2396-2409"],
+    "remediation": "Cap result.payload_bytes to a reasonable maximum (e.g., the expected hidden state size for the model). Validate that payload_bytes matches the expected size for the result kind before allocating."
+  },
+  {
+    "severity": "medium",
+    "location": "ds4.c",
+    "title": "GGUF metadata alignment of zero causes division by zero in align_up",
+    "description": "The align_up() function at line 1498 computes value % alignment. If a malicious GGUF sets the general.alignment metadata key to 0, the code at line 1856 would set m->alignment = 0 only if the value is non-zero (the check `alignment != 0` on line 1857 prevents this). However, m->alignment is initialized to 0 by memset at line 1925. If the GGUF omits the alignment key entirely, alignment stays 0, and align_up(c->pos, 0) at line 1900 causes a division by zero (value % 0).",
+    "impact": "A GGUF file that omits the general.alignment metadata key will cause a SIGFPE (division by zero) when computing tensor_data_pos, crashing the process.",
+    "attack_path": "1. Attacker provides a GGUF v3 file with valid magic/version/tensors but no general.alignment key in metadata. 2. model_open calls parse_metadata then parse_tensors. 3. m->alignment is 0 (never set). 4. parse_tensors calls align_up(c->pos, m->alignment) = align_up(c->pos, 0). 5. align_up computes c->pos % 0, causing SIGFPE.",
+    "evidence": ["ds4.c:1498-1501", "ds4.c:1900", "ds4.c:1925", "ds4.c:1853-1858"],
+    "remediation": "Initialize m->alignment to a default value (e.g., 32) before parsing metadata, or add a check in parse_tensors: if (m->alignment == 0) m->alignment = 32."
+  },
+  {
+    "severity": "medium",
+    "location": "ds4.c",
+    "title": "SSD streaming pread: short read not fully handled in expert cache loading",
+    "description": "In metal_graph_stream_pread_range() at line 11651, pread() can return fewer bytes than requested (short read). The function handles this by advancing the position and continuing the loop. However, the XOR sink accumulation at line 11682-11683 (s ^= buf[0]; s ^= buf[(size_t)nread - 1u]) uses the read data only for a volatile sink, not for actual validation. The concern is that the function is used to pre-load expert weights from the model file into the page cache. If a short read occurs due to a concurrent file modification (truncation), the function silently succeeds with partial data. The caller (metal_graph_stream_prepare_range) does not verify data integrity, and the Metal compute pipeline will use whatever data was loaded, which may be partially stale or zeroed.",
+    "impact": "In SSD streaming mode, a file system event or concurrent modification causing a short pread can result in the Metal GPU using partially-loaded or corrupted expert weight data, producing silently incorrect inference results with no error reported.",
+    "attack_path": "1. ds4 runs in SSD streaming mode with the model on a network filesystem. 2. During decode, metal_graph_stream_pread_range reads expert weights. 3. A network filesystem hiccup or concurrent file modification causes a short pread. 4. The function continues, reporting success. 5. The GPU processes partially-loaded weights, producing incorrect logits.",
+    "evidence": ["ds4.c:11651-11693", "ds4.c:11696-11719"],
+    "remediation": "After the pread loop completes, verify that the total bytes read matches the expected size. Consider adding a checksum verification for critical expert data regions."
+  }
+]
