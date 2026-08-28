@@ -398,6 +398,8 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
                                       float *target_probs);
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
+int ds4_test_qwen4_exp_validate_metadata_file(const char *path);
+int ds4_test_qwen4_exp_weight_binding(void);
 uint64_t ds4_test_mixed_native_count(void);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
