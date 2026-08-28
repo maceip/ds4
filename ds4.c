@@ -16162,6 +16162,32 @@ typedef struct {
     ds4_gpu_tensor *spec_prefix1_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_prefix1_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_prefix1_index_state_score[DS4_MAX_LAYER];
+
+    /* Qwen4Exp recurrent frontier.  Unlike a transformer KV cache, every
+     * GatedDeltaNet token mutates a 48x128x128 F32 state matrix and a
+     * three-row depthwise-convolution history.  The PLE layer adds its own
+     * nine-row dilated-convolution history plus the last two token IDs used
+     * by the n-gram hasher.  Speculative verification therefore needs an
+     * actual tensor snapshot: rewinding append-only QSA cache lengths alone
+     * cannot restore autoregressive identity.
+     *
+     * The Qwen execution-graph allocator owns these tensors.  Shadow tensors
+     * are allocated once when MTP is enabled; snapshot/restore only encode
+     * blit copies and never allocate in the decode loop.  Null active+shadow
+     * pairs are permitted for unowned layers in a distributed slice. */
+    ds4_gpu_tensor *qwen_gdn_conv_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *qwen_gdn_recurrent_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *qwen_spec_gdn_conv_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *qwen_spec_gdn_recurrent_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *qwen_ple_conv_state;
+    ds4_gpu_tensor *qwen_ple_token_state;
+    ds4_gpu_tensor *qwen_spec_ple_conv_state;
+    ds4_gpu_tensor *qwen_spec_ple_token_state;
+    uint32_t qwen_qsa_raw_len[DS4_MAX_LAYER];
+    uint32_t qwen_qsa_pooled_len[DS4_MAX_LAYER];
+    bool qwen_recurrent_state_ready;
+    bool qwen_spec_state_ready;
+
     ds4_gpu_tensor *spec_logits;
     uint32_t layer_n_comp[DS4_MAX_LAYER];
     uint32_t layer_n_index_comp[DS4_MAX_LAYER];
@@ -16976,6 +17002,16 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
     }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->qwen_gdn_conv_state[il]);
+        ds4_gpu_tensor_free(g->qwen_gdn_recurrent_state[il]);
+        ds4_gpu_tensor_free(g->qwen_spec_gdn_conv_state[il]);
+        ds4_gpu_tensor_free(g->qwen_spec_gdn_recurrent_state[il]);
+    }
+    ds4_gpu_tensor_free(g->qwen_ple_conv_state);
+    ds4_gpu_tensor_free(g->qwen_ple_token_state);
+    ds4_gpu_tensor_free(g->qwen_spec_ple_conv_state);
+    ds4_gpu_tensor_free(g->qwen_spec_ple_token_state);
     /* Class P decode-step scratch + decode HC group free across
      * all tier slots. hc_pre / hc_post / hc_comb are VIEWS of hc_split — free
      * them before hc_split so the view struct release happens with the parent
@@ -50598,6 +50634,8 @@ static void ds4_acquire_instance_lock(void) {
 typedef struct {
     uint32_t n_comp[DS4_MAX_LAYER];
     uint32_t n_index_comp[DS4_MAX_LAYER];
+    uint32_t qwen_qsa_raw_len[DS4_MAX_LAYER];
+    uint32_t qwen_qsa_pooled_len[DS4_MAX_LAYER];
     uint32_t mtp_n_raw;
     uint32_t dspark_cache_start;
     uint32_t dspark_cache_token_start;
@@ -52382,6 +52420,56 @@ static void spec_frontier_free(ds4_spec_frontier *f) {
     memset(f, 0, sizeof(*f));
 }
 
+static bool qwen4_exp_frontier_copy_pair(
+        ds4_gpu_tensor *dst,
+        ds4_gpu_tensor *src) {
+    /* A distributed layer slice legitimately has neither tensor.  A single
+     * missing side, however, would make rollback partial and must fail loud. */
+    if (!dst && !src) return true;
+    if (!dst || !src) return false;
+    const uint64_t bytes = ds4_gpu_tensor_bytes(src);
+    if (bytes == 0 || ds4_gpu_tensor_bytes(dst) != bytes) return false;
+    return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes) != 0;
+}
+
+static bool qwen4_exp_frontier_copy_recurrent(
+        ds4_gpu_graph *g,
+        bool           restore) {
+    if (!g || !g->qwen_recurrent_state_ready || !g->qwen_spec_state_ready) {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor *conv_dst = restore
+            ? g->qwen_gdn_conv_state[il]
+            : g->qwen_spec_gdn_conv_state[il];
+        ds4_gpu_tensor *conv_src = restore
+            ? g->qwen_spec_gdn_conv_state[il]
+            : g->qwen_gdn_conv_state[il];
+        ds4_gpu_tensor *state_dst = restore
+            ? g->qwen_gdn_recurrent_state[il]
+            : g->qwen_spec_gdn_recurrent_state[il];
+        ds4_gpu_tensor *state_src = restore
+            ? g->qwen_spec_gdn_recurrent_state[il]
+            : g->qwen_gdn_recurrent_state[il];
+        if (!qwen4_exp_frontier_copy_pair(conv_dst, conv_src) ||
+            !qwen4_exp_frontier_copy_pair(state_dst, state_src)) {
+            return false;
+        }
+    }
+
+    return qwen4_exp_frontier_copy_pair(
+                restore ? g->qwen_ple_conv_state
+                        : g->qwen_spec_ple_conv_state,
+                restore ? g->qwen_spec_ple_conv_state
+                        : g->qwen_ple_conv_state) &&
+           qwen4_exp_frontier_copy_pair(
+                restore ? g->qwen_ple_token_state
+                        : g->qwen_spec_ple_token_state,
+                restore ? g->qwen_spec_ple_token_state
+                        : g->qwen_ple_token_state);
+}
+
 static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
     memset(f, 0, sizeof(*f));
     ds4_gpu_graph *g = &s->graph;
@@ -52392,7 +52480,17 @@ static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
     f->dspark_cache_len = g->dspark_cache_len;
 
     bool ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    if (ok && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            f->qwen_qsa_raw_len[il] = g->qwen_qsa_raw_len[il];
+            f->qwen_qsa_pooled_len[il] = g->qwen_qsa_pooled_len[il];
+        }
+        ok = qwen4_exp_frontier_copy_recurrent(g, false);
+    }
+    for (uint32_t il = 0;
+         ok && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN4_EXP &&
+         il < DS4_N_LAYER;
+         il++) {
         f->n_comp[il] = g->layer_n_comp[il];
         f->n_index_comp[il] = g->layer_n_index_comp[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -52434,7 +52532,17 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
                                                  f->dspark_cache_token_start,
                                                  f->dspark_cache_len);
     }
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    if (ok && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g->qwen_qsa_raw_len[il] = f->qwen_qsa_raw_len[il];
+            g->qwen_qsa_pooled_len[il] = f->qwen_qsa_pooled_len[il];
+        }
+        ok = qwen4_exp_frontier_copy_recurrent(g, true);
+    }
+    for (uint32_t il = 0;
+         ok && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN4_EXP &&
+         il < DS4_N_LAYER;
+         il++) {
         g->layer_n_comp[il] = f->n_comp[il];
         g->layer_n_index_comp[il] = f->n_index_comp[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -52465,6 +52573,12 @@ static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_len) {
     if (!s || prefix_len == 0 || prefix_len > DS4_SPEC_PREFIX_SLOTS) {
         return false;
     }
+    /* Qwen verifier steps mutate GDN and PLE recurrent tensors.  The current
+     * prefix slots contain only DeepSeek compressor state, so using them would
+     * silently combine a rewound QSA frontier with the verifier's final GDN
+     * matrices.  Refuse the shortcut: callers fall back to the saved frontier
+     * and ordinary one-token replay of the accepted prefix. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP) return false;
     const uint32_t slot = prefix_len - 1u;
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_begin_commands() != 0;
@@ -52498,6 +52612,131 @@ static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_len) {
 static bool spec_frontier_commit_prefix1(ds4_session *s) {
     return spec_frontier_commit_prefix(s, 1);
 }
+
+#ifdef DS4_TEST_HOOKS
+static bool qwen4_exp_test_tensor_pattern(
+        ds4_gpu_tensor *tensor,
+        uint8_t         seed,
+        bool            write_pattern) {
+    const uint64_t bytes = ds4_gpu_tensor_bytes(tensor);
+    if (!tensor || bytes == 0 || bytes > 128u) return false;
+    uint8_t pattern[128];
+    uint8_t actual[128];
+    for (uint64_t i = 0; i < bytes; i++) {
+        pattern[i] = (uint8_t)(seed + (uint8_t)(i * 29u));
+    }
+    if (write_pattern) {
+        return ds4_gpu_tensor_write(tensor, 0, pattern, bytes) != 0;
+    }
+    return ds4_gpu_tensor_read(tensor, 0, actual, bytes) != 0 &&
+           memcmp(actual, pattern, (size_t)bytes) == 0;
+}
+
+int ds4_test_qwen4_exp_frontier_roundtrip(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    ds4_session *s = calloc(1, sizeof(*s));
+    if (!s) return 1;
+
+    g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
+    ds4_gpu_graph *g = &s->graph;
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        /* Every fourth layer is QSA and has append-only caches only. */
+        if (((il + 1u) % DS4_QWEN4_EXP_FULL_ATTN_INTERVAL) == 0) {
+            g->qwen_qsa_raw_len[il] = 1000u + il;
+            g->qwen_qsa_pooled_len[il] = 200u + il;
+            continue;
+        }
+        g->qwen_gdn_conv_state[il] = ds4_gpu_tensor_alloc(64);
+        g->qwen_spec_gdn_conv_state[il] = ds4_gpu_tensor_alloc(64);
+        g->qwen_gdn_recurrent_state[il] = ds4_gpu_tensor_alloc(128);
+        g->qwen_spec_gdn_recurrent_state[il] = ds4_gpu_tensor_alloc(128);
+        ok = g->qwen_gdn_conv_state[il] &&
+             g->qwen_spec_gdn_conv_state[il] &&
+             g->qwen_gdn_recurrent_state[il] &&
+             g->qwen_spec_gdn_recurrent_state[il] &&
+             qwen4_exp_test_tensor_pattern(
+                 g->qwen_gdn_conv_state[il], (uint8_t)(3u * il + 1u), true) &&
+             qwen4_exp_test_tensor_pattern(
+                 g->qwen_gdn_recurrent_state[il], (uint8_t)(5u * il + 7u), true);
+    }
+
+    if (ok) {
+        g->qwen_ple_conv_state = ds4_gpu_tensor_alloc(96);
+        g->qwen_spec_ple_conv_state = ds4_gpu_tensor_alloc(96);
+        g->qwen_ple_token_state = ds4_gpu_tensor_alloc(4u * sizeof(uint32_t));
+        g->qwen_spec_ple_token_state =
+            ds4_gpu_tensor_alloc(4u * sizeof(uint32_t));
+        ok = g->qwen_ple_conv_state &&
+             g->qwen_spec_ple_conv_state &&
+             g->qwen_ple_token_state &&
+             g->qwen_spec_ple_token_state &&
+             qwen4_exp_test_tensor_pattern(g->qwen_ple_conv_state, 0x41u, true) &&
+             qwen4_exp_test_tensor_pattern(g->qwen_ple_token_state, 0x83u, true);
+    }
+
+    g->qwen_recurrent_state_ready = ok;
+    g->qwen_spec_state_ready = ok;
+    ds4_spec_frontier frontier = {0};
+    if (ok) ok = spec_frontier_snapshot(&frontier, s);
+
+    uint8_t poison[128];
+    memset(poison, 0xa5, sizeof(poison));
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (((il + 1u) % DS4_QWEN4_EXP_FULL_ATTN_INTERVAL) == 0) {
+            g->qwen_qsa_raw_len[il] = UINT32_MAX;
+            g->qwen_qsa_pooled_len[il] = UINT32_MAX;
+            continue;
+        }
+        ok = ds4_gpu_tensor_write(
+                 g->qwen_gdn_conv_state[il], 0, poison, 64) != 0 &&
+             ds4_gpu_tensor_write(
+                 g->qwen_gdn_recurrent_state[il], 0, poison, 128) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_write(
+                 g->qwen_ple_conv_state, 0, poison, 96) != 0 &&
+             ds4_gpu_tensor_write(
+                 g->qwen_ple_token_state, 0, poison,
+                 4u * sizeof(uint32_t)) != 0;
+    }
+    if (ok) ok = spec_frontier_restore(&frontier, s);
+
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (((il + 1u) % DS4_QWEN4_EXP_FULL_ATTN_INTERVAL) == 0) {
+            ok = g->qwen_qsa_raw_len[il] == 1000u + il &&
+                 g->qwen_qsa_pooled_len[il] == 200u + il;
+            continue;
+        }
+        ok = qwen4_exp_test_tensor_pattern(
+                 g->qwen_gdn_conv_state[il], (uint8_t)(3u * il + 1u), false) &&
+             qwen4_exp_test_tensor_pattern(
+                 g->qwen_gdn_recurrent_state[il], (uint8_t)(5u * il + 7u), false);
+    }
+    if (ok) {
+        ok = qwen4_exp_test_tensor_pattern(
+                 g->qwen_ple_conv_state, 0x41u, false) &&
+             qwen4_exp_test_tensor_pattern(
+                 g->qwen_ple_token_state, 0x83u, false);
+    }
+
+    /* Prefix slots do not yet carry per-step recurrent tensors.  This guard is
+     * the contract that makes callers restore and replay accepted Qwen tokens. */
+    if (ok) ok = !spec_frontier_commit_prefix(s, 1);
+    if (ok) {
+        ds4_spec_frontier missing_shadow = {0};
+        g->qwen_spec_state_ready = false;
+        ok = !spec_frontier_snapshot(&missing_shadow, s);
+        spec_frontier_free(&missing_shadow);
+    }
+
+    spec_frontier_free(&frontier);
+    metal_graph_free(g);
+    free(s);
+    g_ds4_shape = saved_shape;
+    return ok ? 0 : 1;
+}
+#endif
 
 static void session_greedy_splitkv_reset(ds4_session *s) {
     if (!s) return;
