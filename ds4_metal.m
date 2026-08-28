@@ -4338,6 +4338,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_DSV4_KV_SOURCE",    @"metal/dsv4_kv.metal"],
         @[@"DS4_METAL_DSV4_ROPE_SOURCE",  @"metal/dsv4_rope.metal"],
         @[@"DS4_METAL_DSV4_MISC_SOURCE",  @"metal/dsv4_misc.metal"],
+        @[@"DS4_METAL_QWEN4_EXP_GDN_SOURCE", @"metal/qwen4_exp_gdn.metal"],
         @[@"DS4_METAL_ARGSORT_SOURCE",    @"metal/argsort.metal"],
         @[@"DS4_METAL_CPY_SOURCE",        @"metal/cpy.metal"],
         @[@"DS4_METAL_CONCAT_SOURCE",     @"metal/concat.metal"],
@@ -43256,4 +43257,198 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
 
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
     (void)enabled;
+}
+
+enum {
+    DS4_QWEN4_EXP_GDN_KEY_HEADS = 16,
+    DS4_QWEN4_EXP_GDN_VALUE_HEADS = 48,
+    DS4_QWEN4_EXP_GDN_HEAD_DIM = 128,
+    DS4_QWEN4_EXP_GDN_CONV_DIM = 10240,
+    DS4_QWEN4_EXP_GDN_VALUE_DIM = 6144,
+    DS4_QWEN4_EXP_GDN_CONV_STATE_ROWS = 3,
+};
+
+typedef struct {
+    uint32_t n_tokens;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+} ds4_gpu_qwen4_exp_gdn_args;
+
+_Static_assert(sizeof(ds4_gpu_qwen4_exp_gdn_args) == 16,
+               "Qwen4Exp GDN Metal argument ABI changed");
+
+static int ds4_gpu_qwen4_exp_tensor_has(
+        const ds4_gpu_tensor *tensor,
+        uint64_t              bytes) {
+    return tensor && ds4_gpu_tensor_buffer(tensor) &&
+           ds4_gpu_tensor_bytes(tensor) >= bytes;
+}
+
+int ds4_gpu_qwen4_exp_gdn_conv_scan_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        const ds4_gpu_tensor *input,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint32_t              n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_tokens == 0 ||
+        n_tokens > UINT32_MAX / DS4_QWEN4_EXP_GDN_CONV_DIM ||
+        (weight_type != 0 && weight_type != 1)) {
+        return 0;
+    }
+
+    const uint64_t row_bytes =
+        (uint64_t)DS4_QWEN4_EXP_GDN_CONV_DIM * sizeof(float);
+    const uint64_t activation_bytes = (uint64_t)n_tokens * row_bytes;
+    const uint64_t state_bytes =
+        (uint64_t)DS4_QWEN4_EXP_GDN_CONV_STATE_ROWS * row_bytes;
+    const uint64_t element_bytes = weight_type == 0 ? sizeof(float) : sizeof(_Float16);
+    const uint64_t weight_bytes =
+        4ull * DS4_QWEN4_EXP_GDN_CONV_DIM * element_bytes;
+    if (!ds4_gpu_qwen4_exp_tensor_has(out, activation_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(input, activation_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(conv_state, state_bytes) ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+        fprintf(stderr, "ds4: Qwen4Exp GDN convolution received an undersized tensor or model range\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+            weight_type == 0 ? "kernel_qwen4_exp_gdn_conv_scan_f32" :
+                               "kernel_qwen4_exp_gdn_conv_scan_f16");
+        if (!pipeline) return 0;
+
+        uint64_t weight_inner = 0;
+        id<MTLBuffer> weight_buffer = ds4_gpu_wrap_model_range(
+            model_map, model_size, weight_offset, weight_bytes, &weight_inner);
+        if (!weight_buffer) return 0;
+
+        ds4_gpu_qwen4_exp_gdn_args args = { .n_tokens = n_tokens };
+        const NSUInteger nth = MIN((NSUInteger)256,
+                                   pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger groups =
+            (DS4_QWEN4_EXP_GDN_CONV_DIM + nth - 1u) / nth;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weight_buffer offset:(NSUInteger)weight_inner atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(input)
+                offset:ds4_gpu_tensor_offset(input) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(conv_state)
+                offset:ds4_gpu_tensor_offset(conv_state) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "Qwen4Exp GDN depthwise convolution scan");
+    }
+}
+
+int ds4_gpu_qwen4_exp_gdn_recurrent_scan_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        ds4_gpu_tensor       *mixed_qkv,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *ssm_a,
+        const ds4_gpu_tensor *dt_bias,
+        ds4_gpu_tensor       *gate_scratch,
+        uint32_t              n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_tokens == 0 ||
+        n_tokens > UINT32_MAX / DS4_QWEN4_EXP_GDN_CONV_DIM) {
+        return 0;
+    }
+
+    const uint64_t mixed_bytes = (uint64_t)n_tokens *
+        DS4_QWEN4_EXP_GDN_CONV_DIM * sizeof(float);
+    const uint64_t value_bytes = (uint64_t)n_tokens *
+        DS4_QWEN4_EXP_GDN_VALUE_DIM * sizeof(float);
+    const uint64_t scalar_bytes = (uint64_t)n_tokens *
+        DS4_QWEN4_EXP_GDN_VALUE_HEADS * sizeof(float);
+    const uint64_t gate_bytes = 2ull * scalar_bytes;
+    const uint64_t state_bytes = (uint64_t)DS4_QWEN4_EXP_GDN_VALUE_HEADS *
+        DS4_QWEN4_EXP_GDN_HEAD_DIM * DS4_QWEN4_EXP_GDN_HEAD_DIM *
+        sizeof(float);
+    const uint64_t head_bytes =
+        (uint64_t)DS4_QWEN4_EXP_GDN_VALUE_HEADS * sizeof(float);
+    if (!ds4_gpu_qwen4_exp_tensor_has(out, value_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(state, state_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(mixed_qkv, mixed_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(alpha, scalar_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(beta, scalar_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(ssm_a, head_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(dt_bias, head_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(gate_scratch, gate_bytes)) {
+        fprintf(stderr, "ds4: Qwen4Exp GDN recurrent scan received an undersized tensor\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> prepare =
+            ds4_gpu_get_pipeline("kernel_qwen4_exp_gdn_prepare");
+        id<MTLComputePipelineState> scan =
+            ds4_gpu_get_pipeline("kernel_qwen4_exp_gdn_recurrent_scan");
+        if (!prepare || !scan || prepare.maxTotalThreadsPerThreadgroup < 32 ||
+            scan.maxTotalThreadsPerThreadgroup < 128) {
+            return 0;
+        }
+
+        id<MTLBuffer> mixed_buffer = ds4_gpu_tensor_buffer(mixed_qkv);
+        id<MTLBuffer> gate_buffer = ds4_gpu_tensor_buffer(gate_scratch);
+        ds4_gpu_qwen4_exp_gdn_args args = { .n_tokens = n_tokens };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+
+        [enc setComputePipelineState:prepare];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:mixed_buffer
+                offset:ds4_gpu_tensor_offset(mixed_qkv) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(alpha)
+                offset:ds4_gpu_tensor_offset(alpha) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(beta)
+                offset:ds4_gpu_tensor_offset(beta) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(ssm_a)
+                offset:ds4_gpu_tensor_offset(ssm_a) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(dt_bias)
+                offset:ds4_gpu_tensor_offset(dt_bias) atIndex:5];
+        [enc setBuffer:gate_buffer
+                offset:ds4_gpu_tensor_offset(gate_scratch) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                 (NSUInteger)n_tokens * DS4_QWEN4_EXP_GDN_VALUE_HEADS, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+        id<MTLResource> barrier_resources[2] = { mixed_buffer, gate_buffer };
+        [enc memoryBarrierWithResources:barrier_resources count:2u];
+
+        [enc setComputePipelineState:scan];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:mixed_buffer
+                offset:ds4_gpu_tensor_offset(mixed_qkv) atIndex:1];
+        [enc setBuffer:gate_buffer
+                offset:ds4_gpu_tensor_offset(gate_scratch) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(state)
+                offset:ds4_gpu_tensor_offset(state) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                 1, DS4_QWEN4_EXP_GDN_HEAD_DIM / 4,
+                 DS4_QWEN4_EXP_GDN_VALUE_HEADS)
+             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "Qwen4Exp GatedDeltaNet recurrent scan");
+    }
 }

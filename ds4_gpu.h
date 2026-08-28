@@ -79,6 +79,29 @@ int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
 #ifdef __APPLE__
+/* Qwen4Exp GatedDeltaNet primitives.  Both entry points are allocation-free:
+ * graph construction owns the activation and recurrent-state tensors, while
+ * the depthwise-convolution weights remain in the mmap-backed GGUF view. */
+int ds4_gpu_qwen4_exp_gdn_conv_scan_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        const ds4_gpu_tensor *input,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint32_t              n_tokens);
+int ds4_gpu_qwen4_exp_gdn_recurrent_scan_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        ds4_gpu_tensor       *mixed_qkv,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *ssm_a,
+        const ds4_gpu_tensor *dt_bias,
+        ds4_gpu_tensor       *gate_scratch,
+        uint32_t              n_tokens);
+
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(
