@@ -6351,8 +6351,14 @@ static void validate_qwen4_exp_ple_metadata(const ds4_model *m) {
         DS4_QWEN4_EXP_PLE_HEAD_COUNT);
 
     for (uint32_t i = 0; i < DS4_QWEN4_EXP_PLE_NGRAM_SIZE; i++) {
-        if ((g_qwen4_exp_config.ple_layer_multipliers[i] & 1u) == 0) {
+        const uint64_t multiplier =
+            g_qwen4_exp_config.ple_layer_multipliers[i];
+        if ((multiplier & 1u) == 0) {
             ds4_die("Qwen4Exp PLE layer multiplier must be odd");
+        }
+        if (DS4_N_VOCAB < 2u ||
+            multiplier > (uint64_t)INT64_MAX / (DS4_N_VOCAB - 1u)) {
+            ds4_die("Qwen4Exp PLE token product would overflow signed int64");
         }
     }
     for (uint32_t h = 0; h < DS4_QWEN4_EXP_PLE_HEAD_COUNT; h++) {

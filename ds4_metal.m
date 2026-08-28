@@ -4340,6 +4340,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_DSV4_MISC_SOURCE",  @"metal/dsv4_misc.metal"],
         @[@"DS4_METAL_QWEN4_EXP_GDN_SOURCE", @"metal/qwen4_exp_gdn.metal"],
         @[@"DS4_METAL_QWEN4_EXP_QSA_SOURCE", @"metal/qwen4_exp_qsa.metal"],
+        @[@"DS4_METAL_QWEN4_EXP_PLE_SOURCE", @"metal/qwen4_exp_ple.metal"],
         @[@"DS4_METAL_ARGSORT_SOURCE",    @"metal/argsort.metal"],
         @[@"DS4_METAL_CPY_SOURCE",        @"metal/cpy.metal"],
         @[@"DS4_METAL_CONCAT_SOURCE",     @"metal/concat.metal"],
@@ -43741,5 +43742,133 @@ int ds4_gpu_qwen4_exp_qsa_decode_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned,
                                               "Qwen4Exp QSA sparse decode");
+    }
+}
+
+enum {
+    DS4_QWEN4_EXP_PLE_HEADS = 16,
+    DS4_QWEN4_EXP_PLE_HEAD_DIM = 160,
+    DS4_QWEN4_EXP_PLE_EMBED_DIM = 2560,
+    DS4_QWEN4_EXP_PLE_TYPE_F16 = 1,
+    DS4_QWEN4_EXP_PLE_TYPE_Q8_0 = 8,
+    DS4_QWEN4_EXP_PLE_TYPE_MXFP4 = 39,
+};
+
+typedef struct {
+    uint32_t n_tokens;
+    uint32_t eos_token;
+    uint32_t table_type;
+    uint32_t pad0;
+    uint64_t table_rows;
+    uint64_t row_bytes;
+    uint64_t multipliers[3];
+    uint64_t head_vocab_sizes[DS4_QWEN4_EXP_PLE_HEADS];
+    uint64_t head_offsets[DS4_QWEN4_EXP_PLE_HEADS];
+} ds4_gpu_qwen4_exp_ple_args;
+
+_Static_assert(sizeof(ds4_gpu_qwen4_exp_ple_args) == 312,
+               "Qwen4Exp PLE argument ABI changed");
+
+int ds4_gpu_qwen4_exp_ple_hash_gather_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *token_state,
+        const ds4_gpu_tensor *token_ids,
+        uint32_t              n_tokens,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              table_offset,
+        uint64_t              table_rows,
+        uint32_t              table_type,
+        const uint64_t        multipliers[3],
+        const uint64_t        head_vocab_sizes[16],
+        const uint64_t        head_offsets[16],
+        uint32_t              eos_token) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!multipliers || !head_vocab_sizes || !head_offsets ||
+        n_tokens == 0 || table_rows == 0 ||
+        n_tokens > UINT32_MAX / DS4_QWEN4_EXP_PLE_EMBED_DIM) {
+        return 0;
+    }
+
+    uint64_t row_bytes = 0;
+    switch (table_type) {
+    case DS4_QWEN4_EXP_PLE_TYPE_F16:
+        row_bytes = DS4_QWEN4_EXP_PLE_HEAD_DIM * sizeof(_Float16);
+        break;
+    case DS4_QWEN4_EXP_PLE_TYPE_Q8_0:
+        row_bytes = (DS4_QWEN4_EXP_PLE_HEAD_DIM / 32u) * 34u;
+        break;
+    case DS4_QWEN4_EXP_PLE_TYPE_MXFP4:
+        row_bytes = (DS4_QWEN4_EXP_PLE_HEAD_DIM / 32u) * 17u;
+        break;
+    default:
+        return 0;
+    }
+    if (table_rows > UINT64_MAX / row_bytes) return 0;
+    const uint64_t table_bytes = table_rows * row_bytes;
+    const uint64_t output_values =
+        (uint64_t)n_tokens * DS4_QWEN4_EXP_PLE_EMBED_DIM;
+    if (output_values > UINT64_MAX / sizeof(float) ||
+        !ds4_gpu_qwen4_exp_tensor_has(out, output_values * sizeof(float)) ||
+        !ds4_gpu_qwen4_exp_tensor_has(token_ids,
+                                      (uint64_t)n_tokens * sizeof(int32_t)) ||
+        !ds4_gpu_qwen4_exp_tensor_has(token_state, 4u * sizeof(uint32_t)) ||
+        table_offset > model_size || table_bytes > model_size - table_offset) {
+        fprintf(stderr, "ds4: Qwen4Exp PLE received an undersized tensor or model range\n");
+        return 0;
+    }
+    for (uint32_t i = 0; i < 3u; i++) {
+        if ((multipliers[i] & 1u) == 0) return 0;
+    }
+    for (uint32_t head = 0; head < DS4_QWEN4_EXP_PLE_HEADS; head++) {
+        if (head_vocab_sizes[head] == 0 ||
+            head_offsets[head] > table_rows ||
+            head_vocab_sizes[head] > table_rows - head_offsets[head]) {
+            return 0;
+        }
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen4_exp_ple_hash_gather");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
+        uint64_t table_inner = 0;
+        id<MTLBuffer> table_buffer = ds4_gpu_wrap_model_range(
+            model_map, model_size, table_offset, table_bytes, &table_inner);
+        if (!table_buffer) return 0;
+
+        ds4_gpu_qwen4_exp_ple_args args = {
+            .n_tokens = n_tokens,
+            .eos_token = eos_token,
+            .table_type = table_type,
+            .table_rows = table_rows,
+            .row_bytes = row_bytes,
+        };
+        memcpy(args.multipliers, multipliers, sizeof(args.multipliers));
+        memcpy(args.head_vocab_sizes, head_vocab_sizes,
+               sizeof(args.head_vocab_sizes));
+        memcpy(args.head_offsets, head_offsets, sizeof(args.head_offsets));
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:table_buffer offset:(NSUInteger)table_inner atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(token_ids)
+                offset:ds4_gpu_tensor_offset(token_ids) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(token_state)
+                offset:ds4_gpu_tensor_offset(token_state) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc setThreadgroupMemoryLength:
+                 DS4_QWEN4_EXP_PLE_HEADS * sizeof(uint64_t) atIndex:0];
+        [enc setThreadgroupMemoryLength:3u * sizeof(uint32_t) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned,
+                                              "Qwen4Exp PLE hash gather");
     }
 }

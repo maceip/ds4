@@ -152,6 +152,25 @@ int ds4_gpu_qwen4_exp_qsa_decode_tensor(
         uint32_t              cache_capacity,
         bool                  cache_f16);
 
+/* PLE token state is four uint32 values in a GPU tensor:
+ * [older_token, newer_token, valid_count, reserved].  It is deliberately a
+ * tensor so speculative decode can snapshot and restore it without a CPU
+ * readback. */
+int ds4_gpu_qwen4_exp_ple_hash_gather_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *token_state,
+        const ds4_gpu_tensor *token_ids,
+        uint32_t              n_tokens,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              table_offset,
+        uint64_t              table_rows,
+        uint32_t              table_type,
+        const uint64_t        multipliers[3],
+        const uint64_t        head_vocab_sizes[16],
+        const uint64_t        head_offsets[16],
+        uint32_t              eos_token);
+
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(
