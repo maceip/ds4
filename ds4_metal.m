@@ -82,6 +82,7 @@ static id<MTLComputePipelineState> g_add2_pipeline;
 static id<MTLComputePipelineState> g_add3_pipeline;
 static id<MTLComputePipelineState> g_moe_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_sum8_pipeline;
+static id<MTLComputePipelineState> g_qwen4_exp_moe_sum10_pipeline;
 static id<MTLComputePipelineState> g_mul_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_plain_pipeline;
@@ -557,7 +558,7 @@ static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
 static int g_mpp_invalid_env_reported;
-#define DS4_METAL_MAX_ROUTED_EXPERT_USED 8
+#define DS4_METAL_MAX_ROUTED_EXPERT_USED 10
 static int32_t g_routed_moe_selected_override[DS4_METAL_MAX_ROUTED_EXPERT_USED];
 static uint32_t g_routed_moe_selected_override_n;
 static int g_moe_selected_trace_record_initialized;
@@ -606,6 +607,9 @@ static uint32_t g_model_view_count;
 
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
+    /* SSD expert streaming remains the existing DeepSeek/GLM lane. Qwen's
+     * 512 experts use resident mmap views; do not silently widen the streaming
+     * address-table ABI, whose Metal kernels are intentionally capped at 384. */
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT = 384,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED = DS4_METAL_MAX_ROUTED_EXPERT_USED,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES =
@@ -4341,6 +4345,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_QWEN4_EXP_GDN_SOURCE", @"metal/qwen4_exp_gdn.metal"],
         @[@"DS4_METAL_QWEN4_EXP_QSA_SOURCE", @"metal/qwen4_exp_qsa.metal"],
         @[@"DS4_METAL_QWEN4_EXP_PLE_SOURCE", @"metal/qwen4_exp_ple.metal"],
+        @[@"DS4_METAL_QWEN4_EXP_MOE_SOURCE", @"metal/qwen4_exp_moe.metal"],
         @[@"DS4_METAL_ARGSORT_SOURCE",    @"metal/argsort.metal"],
         @[@"DS4_METAL_CPY_SOURCE",        @"metal/cpy.metal"],
         @[@"DS4_METAL_CONCAT_SOURCE",     @"metal/concat.metal"],
@@ -6890,6 +6895,25 @@ int ds4_gpu_init(void) {
         g_moe_sum8_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_moe_sum8_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_moe_sum8_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_qwen4_exp_moe_sum10_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_qwen4_exp_moe_sum10_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
+        g_qwen4_exp_moe_sum10_pipeline =
+            [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_qwen4_exp_moe_sum10_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_qwen4_exp_moe_sum10_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -10202,6 +10226,7 @@ void ds4_gpu_cleanup(void) {
         g_add3_pipeline = nil;
         g_moe_sum6_pipeline = nil;
         g_moe_sum8_pipeline = nil;
+        g_qwen4_exp_moe_sum10_pipeline = nil;
         g_mul_pipeline = nil;
         g_bin_mul_scalar_pipeline = nil;
         g_bin_div_row_pipeline = nil;
@@ -31558,6 +31583,43 @@ static int ds4_gpu_encode_moe_sum8(
     return 1;
 }
 
+static int ds4_gpu_encode_qwen4_exp_moe_sum10(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        experts,
+        NSUInteger           experts_off,
+        id<MTLBuffer>        out,
+        NSUInteger           out_off,
+        uint32_t             out_dim,
+        uint32_t             n_tokens) {
+    if (!cb || !experts || !out || out_dim == 0 || n_tokens == 0 ||
+        !g_qwen4_exp_moe_sum10_pipeline) {
+        return 0;
+    }
+
+    const uint64_t out_row_bytes = (uint64_t)out_dim * sizeof(float);
+    ds4_gpu_dsv4_moe_sum6_args args = {
+        .width = out_dim,
+        .tokens = n_tokens,
+        .src_token_stride = 10u * out_row_bytes,
+        .dst_token_stride = out_row_bytes,
+    };
+
+    NSUInteger nth = g_qwen4_exp_moe_sum10_pipeline.maxTotalThreadsPerThreadgroup;
+    if (nth > 256u) nth = 256u;
+    if (nth > out_dim) nth = out_dim;
+    if (nth == 0) nth = 1u;
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_qwen4_exp_moe_sum10_pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:experts offset:experts_off atIndex:1];
+    [enc setBuffer:out offset:out_off atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static ds4_gpu_bin_args ds4_gpu_make_moe_add_args(
         uint32_t out_dim,
         uint32_t n_tokens,
@@ -31627,6 +31689,17 @@ static int ds4_gpu_encode_moe_sum_experts(
                                   out_off,
                                   out_dim,
                                   n_tokens)) {
+        return 1;
+    }
+
+    if (n_expert == 10 &&
+        ds4_gpu_encode_qwen4_exp_moe_sum10(cb,
+                                            experts,
+                                            experts_off,
+                                            out,
+                                            out_off,
+                                            out_dim,
+                                            n_tokens)) {
         return 1;
     }
 
@@ -43870,5 +43943,59 @@ int ds4_gpu_qwen4_exp_ple_hash_gather_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned,
                                               "Qwen4Exp PLE hash gather");
+    }
+}
+
+typedef struct {
+    uint32_t n_tokens;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+} ds4_gpu_qwen4_exp_moe_router_args;
+
+_Static_assert(sizeof(ds4_gpu_qwen4_exp_moe_router_args) == 16,
+               "Qwen4Exp MoE router argument layout drift");
+
+int ds4_gpu_qwen4_exp_moe_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_tokens) {
+    enum { QWEN4_EXP_MOE_EXPERTS = 512, QWEN4_EXP_MOE_TOP_K = 10 };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_tokens == 0) return 0;
+    const uint64_t logits_count = (uint64_t)n_tokens * QWEN4_EXP_MOE_EXPERTS;
+    const uint64_t route_count = (uint64_t)n_tokens * QWEN4_EXP_MOE_TOP_K;
+    if (!ds4_gpu_qwen4_exp_tensor_has(logits, logits_count * sizeof(float)) ||
+        !ds4_gpu_qwen4_exp_tensor_has(selected, route_count * sizeof(int32_t)) ||
+        !ds4_gpu_qwen4_exp_tensor_has(weights, route_count * sizeof(float))) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen4_exp_moe_router_top10");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 512u) return 0;
+
+        ds4_gpu_qwen4_exp_moe_router_args args = { .n_tokens = n_tokens };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(logits)
+                offset:ds4_gpu_tensor_offset(logits) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected)
+                offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(weights)
+                offset:ds4_gpu_tensor_offset(weights) atIndex:3];
+        [enc setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:512u * sizeof(int32_t) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(512u, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned,
+                                              "Qwen4Exp MoE router");
     }
 }

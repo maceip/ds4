@@ -171,6 +171,15 @@ int ds4_gpu_qwen4_exp_ple_hash_gather_tensor(
         const uint64_t        head_offsets[16],
         uint32_t              eos_token);
 
+/* Qwen4Exp routing is fixed at 512 experts / top-10.  The router consumes raw
+ * FP32 logits and writes descending selected-logit order plus precise-softmax
+ * weights, matching the authoritative MLX graph without DeepSeek transforms. */
+int ds4_gpu_qwen4_exp_moe_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_tokens);
+
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(
