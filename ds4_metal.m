@@ -4339,6 +4339,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_DSV4_ROPE_SOURCE",  @"metal/dsv4_rope.metal"],
         @[@"DS4_METAL_DSV4_MISC_SOURCE",  @"metal/dsv4_misc.metal"],
         @[@"DS4_METAL_QWEN4_EXP_GDN_SOURCE", @"metal/qwen4_exp_gdn.metal"],
+        @[@"DS4_METAL_QWEN4_EXP_QSA_SOURCE", @"metal/qwen4_exp_qsa.metal"],
         @[@"DS4_METAL_ARGSORT_SOURCE",    @"metal/argsort.metal"],
         @[@"DS4_METAL_CPY_SOURCE",        @"metal/cpy.metal"],
         @[@"DS4_METAL_CONCAT_SOURCE",     @"metal/concat.metal"],
@@ -43450,5 +43451,295 @@ int ds4_gpu_qwen4_exp_gdn_recurrent_scan_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(
             cb, owned, "Qwen4Exp GatedDeltaNet recurrent scan");
+    }
+}
+
+typedef struct {
+    uint32_t block_index;
+    uint32_t cache_f16;
+    float    eps;
+    uint32_t pad0;
+    ds4_gpu_qwen4_exp_rope_params rope;
+} ds4_gpu_qwen4_exp_qsa_pool_args;
+
+typedef struct {
+    uint32_t position;
+    float    eps;
+    uint32_t pad0;
+    uint32_t pad1;
+    ds4_gpu_qwen4_exp_rope_params rope;
+} ds4_gpu_qwen4_exp_qsa_query_args;
+
+typedef struct {
+    uint32_t n_blocks;
+    uint32_t cache_f16;
+    uint32_t pad0;
+    uint32_t pad1;
+} ds4_gpu_qwen4_exp_qsa_score_args;
+
+typedef struct {
+    uint32_t n_selected_blocks;
+    uint32_t position;
+    uint32_t cache_capacity;
+    uint32_t cache_f16;
+} ds4_gpu_qwen4_exp_qsa_decode_args;
+
+_Static_assert(sizeof(ds4_gpu_qwen4_exp_rope_params) == 32,
+               "Qwen4Exp RoPE argument ABI changed");
+_Static_assert(sizeof(ds4_gpu_qwen4_exp_qsa_pool_args) == 48,
+               "Qwen4Exp QSA pool argument ABI changed");
+_Static_assert(sizeof(ds4_gpu_qwen4_exp_qsa_query_args) == 48,
+               "Qwen4Exp QSA query argument ABI changed");
+_Static_assert(sizeof(ds4_gpu_qwen4_exp_qsa_score_args) == 16,
+               "Qwen4Exp QSA score argument ABI changed");
+_Static_assert(sizeof(ds4_gpu_qwen4_exp_qsa_decode_args) == 16,
+               "Qwen4Exp QSA decode argument ABI changed");
+
+static int ds4_gpu_qwen4_exp_rope_valid(
+        const ds4_gpu_qwen4_exp_rope_params *rope,
+        uint32_t                             head_dim) {
+    return rope && rope->n_rot != 0 && rope->n_rot <= head_dim &&
+           (rope->n_rot & 1u) == 0 && rope->freq_base > 0.0f &&
+           rope->freq_scale > 0.0f &&
+           (rope->ext_factor == 0.0f || rope->n_ctx_orig != 0);
+}
+
+int ds4_gpu_qwen4_exp_qsa_pool_block_tensor(
+        ds4_gpu_tensor                      *pooled_keys,
+        const ds4_gpu_tensor                *raw_keys,
+        const void                          *model_map,
+        uint64_t                             model_size,
+        uint64_t                             norm_offset,
+        uint32_t                             block_index,
+        bool                                 cache_f16,
+        float                                eps,
+        const ds4_gpu_qwen4_exp_rope_params *rope) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_gpu_qwen4_exp_rope_valid(rope, 128) || eps <= 0.0f ||
+        block_index > UINT32_MAX / 4u - 1u) {
+        return 0;
+    }
+
+    const uint64_t element_bytes = cache_f16 ? sizeof(_Float16) : sizeof(float);
+    const uint64_t raw_count = ((uint64_t)block_index + 1u) * 4u * 128u;
+    const uint64_t pooled_count = ((uint64_t)block_index + 1u) * 128u;
+    const uint64_t norm_bytes = 128u * sizeof(float);
+    if (!ds4_gpu_qwen4_exp_tensor_has(raw_keys, raw_count * element_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(pooled_keys,
+                                      pooled_count * element_bytes) ||
+        norm_offset > model_size || norm_bytes > model_size - norm_offset) {
+        fprintf(stderr, "ds4: Qwen4Exp QSA block pool received an undersized tensor or model range\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+            cache_f16 ? "kernel_qwen4_exp_qsa_pool_block_f16" :
+                        "kernel_qwen4_exp_qsa_pool_block_f32");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 32) return 0;
+        uint64_t norm_inner = 0;
+        id<MTLBuffer> norm_buffer = ds4_gpu_wrap_model_range(
+            model_map, model_size, norm_offset, norm_bytes, &norm_inner);
+        if (!norm_buffer) return 0;
+
+        ds4_gpu_qwen4_exp_qsa_pool_args args = {
+            .block_index = block_index,
+            .cache_f16 = cache_f16 ? 1u : 0u,
+            .eps = eps,
+            .rope = *rope,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(raw_keys)
+                offset:ds4_gpu_tensor_offset(raw_keys) atIndex:1];
+        [enc setBuffer:norm_buffer offset:(NSUInteger)norm_inner atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(pooled_keys)
+                offset:ds4_gpu_tensor_offset(pooled_keys) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned,
+                                              "Qwen4Exp QSA block pool");
+    }
+}
+
+int ds4_gpu_qwen4_exp_qsa_prepare_query_tensor(
+        ds4_gpu_tensor                      *prepared_query,
+        const ds4_gpu_tensor                *raw_query,
+        const void                          *model_map,
+        uint64_t                             model_size,
+        uint64_t                             norm_offset,
+        uint32_t                             position,
+        float                                eps,
+        const ds4_gpu_qwen4_exp_rope_params *rope) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_gpu_qwen4_exp_rope_valid(rope, 128) || eps <= 0.0f) return 0;
+    const uint64_t query_bytes = 4u * 128u * sizeof(float);
+    const uint64_t norm_bytes = 128u * sizeof(float);
+    if (!ds4_gpu_qwen4_exp_tensor_has(raw_query, query_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(prepared_query, query_bytes) ||
+        norm_offset > model_size || norm_bytes > model_size - norm_offset) {
+        fprintf(stderr, "ds4: Qwen4Exp QSA query preparation received an undersized tensor or model range\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen4_exp_qsa_prepare_query");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 32) return 0;
+        uint64_t norm_inner = 0;
+        id<MTLBuffer> norm_buffer = ds4_gpu_wrap_model_range(
+            model_map, model_size, norm_offset, norm_bytes, &norm_inner);
+        if (!norm_buffer) return 0;
+        ds4_gpu_qwen4_exp_qsa_query_args args = {
+            .position = position,
+            .eps = eps,
+            .rope = *rope,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(raw_query)
+                offset:ds4_gpu_tensor_offset(raw_query) atIndex:1];
+        [enc setBuffer:norm_buffer offset:(NSUInteger)norm_inner atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(prepared_query)
+                offset:ds4_gpu_tensor_offset(prepared_query) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(4, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned,
+                                              "Qwen4Exp QSA query preparation");
+    }
+}
+
+int ds4_gpu_qwen4_exp_qsa_score_blocks_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *prepared_query,
+        const ds4_gpu_tensor *pooled_keys,
+        uint32_t              n_blocks,
+        bool                  cache_f16) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_blocks == 0) return 0;
+    const uint64_t element_bytes = cache_f16 ? sizeof(_Float16) : sizeof(float);
+    if (!ds4_gpu_qwen4_exp_tensor_has(scores,
+                                      (uint64_t)n_blocks * sizeof(float)) ||
+        !ds4_gpu_qwen4_exp_tensor_has(prepared_query,
+                                      4u * 128u * sizeof(float)) ||
+        !ds4_gpu_qwen4_exp_tensor_has(pooled_keys,
+                                      (uint64_t)n_blocks * 128u * element_bytes)) {
+        fprintf(stderr, "ds4: Qwen4Exp QSA block scoring received an undersized tensor\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+            cache_f16 ? "kernel_qwen4_exp_qsa_score_blocks_f16" :
+                        "kernel_qwen4_exp_qsa_score_blocks_f32");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) return 0;
+        ds4_gpu_qwen4_exp_qsa_score_args args = {
+            .n_blocks = n_blocks,
+            .cache_f16 = cache_f16 ? 1u : 0u,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(prepared_query)
+                offset:ds4_gpu_tensor_offset(prepared_query) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(pooled_keys)
+                offset:ds4_gpu_tensor_offset(pooled_keys) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(scores)
+                offset:ds4_gpu_tensor_offset(scores) atIndex:3];
+        [enc setThreadgroupMemoryLength:4u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_blocks, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned,
+                                              "Qwen4Exp QSA block scoring");
+    }
+}
+
+int ds4_gpu_qwen4_exp_qsa_decode_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        const ds4_gpu_tensor *selected_blocks,
+        uint32_t              n_selected_blocks,
+        uint32_t              position,
+        uint32_t              cache_capacity,
+        bool                  cache_f16) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (cache_capacity == 0 || position >= cache_capacity ||
+        n_selected_blocks > 512u) {
+        return 0;
+    }
+    const uint64_t head_values = 24u * 256u;
+    const uint64_t cache_values =
+        (uint64_t)cache_capacity * 2u * 256u;
+    const uint64_t cache_bytes = cache_values *
+        (cache_f16 ? sizeof(_Float16) : sizeof(float));
+    const uint64_t selected_bytes =
+        (uint64_t)n_selected_blocks * sizeof(int32_t);
+    if (!ds4_gpu_qwen4_exp_tensor_has(out, head_values * sizeof(float)) ||
+        !ds4_gpu_qwen4_exp_tensor_has(query, head_values * sizeof(float)) ||
+        !ds4_gpu_qwen4_exp_tensor_has(gate, head_values * sizeof(float)) ||
+        !ds4_gpu_qwen4_exp_tensor_has(key_cache, cache_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(value_cache, cache_bytes) ||
+        !ds4_gpu_qwen4_exp_tensor_has(selected_blocks,
+                                      selected_bytes ? selected_bytes : sizeof(int32_t))) {
+        fprintf(stderr, "ds4: Qwen4Exp QSA decode received an undersized tensor\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+            cache_f16 ? "kernel_qwen4_exp_qsa_decode_f16" :
+                        "kernel_qwen4_exp_qsa_decode_f32");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
+        const uint32_t tail = (position + 1u) % 4u;
+        const uint32_t n_keys = n_selected_blocks * 4u + tail;
+        if (n_keys == 0) return 0;
+        ds4_gpu_qwen4_exp_qsa_decode_args args = {
+            .n_selected_blocks = n_selected_blocks,
+            .position = position,
+            .cache_capacity = cache_capacity,
+            .cache_f16 = cache_f16 ? 1u : 0u,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(query)
+                offset:ds4_gpu_tensor_offset(query) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(gate)
+                offset:ds4_gpu_tensor_offset(gate) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(key_cache)
+                offset:ds4_gpu_tensor_offset(key_cache) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(value_cache)
+                offset:ds4_gpu_tensor_offset(value_cache) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected_blocks)
+                offset:ds4_gpu_tensor_offset(selected_blocks) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:6];
+        [enc setThreadgroupMemoryLength:
+                 ((NSUInteger)256u + n_keys) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(24, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned,
+                                              "Qwen4Exp QSA sparse decode");
     }
 }

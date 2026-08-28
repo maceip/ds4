@@ -102,6 +102,56 @@ int ds4_gpu_qwen4_exp_gdn_recurrent_scan_tensor(
         ds4_gpu_tensor       *gate_scratch,
         uint32_t              n_tokens);
 
+typedef struct {
+    uint32_t n_ctx_orig;
+    uint32_t n_rot;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+} ds4_gpu_qwen4_exp_rope_params;
+
+/* QSA indexer/cache and gathered decode attention.  The caller owns every
+ * cache/scratch tensor, including score and top-k storage. */
+int ds4_gpu_qwen4_exp_qsa_pool_block_tensor(
+        ds4_gpu_tensor                         *pooled_keys,
+        const ds4_gpu_tensor                   *raw_keys,
+        const void                             *model_map,
+        uint64_t                                model_size,
+        uint64_t                                norm_offset,
+        uint32_t                                block_index,
+        bool                                    cache_f16,
+        float                                   eps,
+        const ds4_gpu_qwen4_exp_rope_params    *rope);
+int ds4_gpu_qwen4_exp_qsa_prepare_query_tensor(
+        ds4_gpu_tensor                         *prepared_query,
+        const ds4_gpu_tensor                   *raw_query,
+        const void                             *model_map,
+        uint64_t                                model_size,
+        uint64_t                                norm_offset,
+        uint32_t                                position,
+        float                                   eps,
+        const ds4_gpu_qwen4_exp_rope_params    *rope);
+int ds4_gpu_qwen4_exp_qsa_score_blocks_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *prepared_query,
+        const ds4_gpu_tensor *pooled_keys,
+        uint32_t              n_blocks,
+        bool                  cache_f16);
+int ds4_gpu_qwen4_exp_qsa_decode_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        const ds4_gpu_tensor *selected_blocks,
+        uint32_t              n_selected_blocks,
+        uint32_t              position,
+        uint32_t              cache_capacity,
+        bool                  cache_f16);
+
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(

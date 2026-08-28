@@ -4,9 +4,11 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 QWEN4_EXP_GDN_TEST := tests/test_qwen4_exp_gdn_metal
+QWEN4_EXP_QSA_TEST := tests/test_qwen4_exp_qsa_metal
 else
 NATIVE_CPU_FLAG ?= -march=native
 QWEN4_EXP_GDN_TEST :=
+QWEN4_EXP_QSA_TEST :=
 endif
 SAMPLING_TEST := tests/test_sampling
 
@@ -67,7 +69,7 @@ endif
 .PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut test-qwen4-exp-gdn-metal
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut test-qwen4-exp-gdn-metal test-qwen4-exp-qsa-metal
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -81,6 +83,7 @@ help:
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
 	@echo "  make test-qwen4-exp-gdn-metal  Run Qwen4Exp GatedDeltaNet Metal exactness tests"
+	@echo "  make test-qwen4-exp-qsa-metal  Run Qwen4Exp query-selected attention Metal tests"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
@@ -140,6 +143,12 @@ tests/test_qwen4_exp_gdn_metal.o: tests/test_qwen4_exp_gdn_metal.c ds4_gpu.h
 tests/test_qwen4_exp_gdn_metal: tests/test_qwen4_exp_gdn_metal.o ds4_metal.o
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_qwen4_exp_qsa_metal.o: tests/test_qwen4_exp_qsa_metal.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_qwen4_exp_qsa_metal: tests/test_qwen4_exp_qsa_metal.o ds4_metal.o
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
 check-mxfp4-half-lut:
 	python3 metal/generate_mxfp4_half_lut.py --check
 
@@ -148,6 +157,9 @@ test-mxfp4-metal: check-mxfp4-half-lut tests/test_mxfp4_metal
 
 test-qwen4-exp-gdn-metal: tests/test_qwen4_exp_gdn_metal
 	./tests/test_qwen4_exp_gdn_metal
+
+test-qwen4-exp-qsa-metal: tests/test_qwen4_exp_qsa_metal
+	./tests/test_qwen4_exp_qsa_metal
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -498,7 +510,7 @@ endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_qwen4_exp_loader tests/test_gpu_args \
-	$(SAMPLING_TEST) $(QWEN4_EXP_GDN_TEST) ds4 ds4-server ds4-bench ds4-agent
+	$(SAMPLING_TEST) $(QWEN4_EXP_GDN_TEST) $(QWEN4_EXP_QSA_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -509,6 +521,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	./tests/test_gpu_args_cli.sh
 	./tests/test_sampling
 	$(if $(QWEN4_EXP_GDN_TEST),./$(QWEN4_EXP_GDN_TEST),:)
+	$(if $(QWEN4_EXP_QSA_TEST),./$(QWEN4_EXP_QSA_TEST),:)
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \
@@ -544,4 +557,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_qwen4_exp_gdn_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_qwen4_exp_loader tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_qwen4_exp_gdn_metal tests/test_qwen4_exp_qsa_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_qwen4_exp_loader tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
